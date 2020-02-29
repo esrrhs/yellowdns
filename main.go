@@ -12,10 +12,35 @@ import (
 )
 
 type dnscache struct {
-	host   string
-	ip     string
-	extern bool
-	time   time.Time
+	host       string
+	ip         string
+	externip   string
+	extern     bool
+	fromextern bool
+	time       time.Time
+}
+
+type dnscachestatus struct {
+	LocalDNS     int
+	Local_local  int
+	Local_extern int
+	ExternDNS    int
+	Extern_same  int
+	Extern_diff  int
+}
+
+type dnsserverstatus struct {
+	Reqnum        int
+	ResNum        int
+	Packerror     int
+	Anum          int
+	ACachenum     int
+	Localnum      int
+	Externnum     int
+	ExternFailnum int
+	LocalFailnum  int
+	LocalRetnum   int
+	ExternRetnum  int
 }
 
 type dnsserver struct {
@@ -23,6 +48,7 @@ type dnsserver struct {
 	localregion string
 	timeout     int
 	expire      int
+	status      dnsserverstatus
 
 	cache              sync.Map
 	localsereraddr     *net.UDPAddr
@@ -125,6 +151,8 @@ func main() {
 
 		loggo.Info("recv udp %v from %v", n, srcaddr)
 
+		gds.status.Reqnum++
+
 		go forward(srcaddr, bytes[0:n])
 	}
 }
@@ -133,18 +161,28 @@ func updateCache() {
 	defer common.CrashLog()
 
 	for {
-		local := 0
-		extern := 0
+		dcs := dnscachestatus{}
+
 		tmpdelete := make([]string, 0)
 
 		gds.cache.Range(func(key, value interface{}) bool {
 			host := key.(string)
 			dc := value.(*dnscache)
 
-			if dc.extern {
-				extern++
+			if dc.fromextern {
+				dcs.ExternDNS++
+				if dc.externip != dc.ip {
+					dcs.Extern_diff++
+				} else {
+					dcs.Extern_same++
+				}
 			} else {
-				local++
+				if dc.extern {
+					dcs.Local_extern++
+				} else {
+					dcs.Local_local++
+				}
+				dcs.LocalDNS++
 			}
 
 			if time.Now().Sub(dc.time) > time.Hour*time.Duration(gds.expire) {
@@ -154,14 +192,17 @@ func updateCache() {
 			return true
 		})
 
-		loggo.Warn("local %d, extern %d, total %d", local, extern, local+extern)
+		loggo.Warn("\n%s%s", common.StuctToTable(&dcs),
+			common.StuctToTable(&(gds.status)))
 
 		for _, host := range tmpdelete {
 			gds.cache.Delete(host)
 			loggo.Warn("delete expire cache %s", host)
 		}
 
-		time.Sleep(time.Second)
+		gds.status = dnsserverstatus{}
+
+		time.Sleep(time.Minute)
 	}
 
 }
@@ -172,6 +213,7 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 	msg := dns.Msg{}
 	err := msg.Unpack(srcreq)
 	if err != nil {
+		gds.status.Packerror++
 		loggo.Error("dns Msg Unpack fail %v", err)
 		return
 	}
@@ -180,10 +222,12 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 	extern := false
 	for _, q := range msg.Question {
 		if q.Qtype == dns.TypeA {
+			gds.status.Anum++
 			v, ok := gds.cache.Load(q.Name)
 			if !ok {
 				continue
 			}
+			gds.status.ACachenum++
 			dc := v.(*dnscache)
 			if dc.extern {
 				extern = true
@@ -202,9 +246,12 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
 	defer common.CrashLog()
 
+	gds.status.Localnum++
+
 	loggo.Info("forward local start %v %v", srcaddr, gds.localsereraddr)
 	c, err := net.DialUDP("udp", nil, gds.localsereraddr)
 	if err != nil {
+		gds.status.LocalFailnum++
 		loggo.Error("DialUDP local fail %v", err)
 		return
 	}
@@ -212,6 +259,7 @@ func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
 
 	_, err = c.Write(srcreq)
 	if err != nil {
+		gds.status.LocalFailnum++
 		loggo.Error("Write local fail %v", err)
 		return
 	}
@@ -221,11 +269,14 @@ func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
 	c.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(gds.timeout)))
 	n, err := c.Read(bytes)
 	if err != nil {
+		gds.status.LocalFailnum++
 		loggo.Info("ReadFromUDP local fail %v", err)
 		return
 	}
 
 	loggo.Info("forward local ret %v %v", srcaddr, gds.externalserveraddr)
+
+	gds.status.LocalRetnum++
 
 	go processret(false, srcaddr, srcreq, bytes[0:n])
 }
@@ -233,9 +284,12 @@ func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
 func forwardextern(srcaddr *net.UDPAddr, srcreq []byte) {
 	defer common.CrashLog()
 
+	gds.status.Externnum++
+
 	loggo.Info("forward extern start %v %v", srcaddr, gds.externalserveraddr)
 	c, err := net.DialUDP("udp", nil, gds.externalserveraddr)
 	if err != nil {
+		gds.status.ExternFailnum++
 		loggo.Error("DialUDP extern fail %v", err)
 		return
 	}
@@ -243,6 +297,7 @@ func forwardextern(srcaddr *net.UDPAddr, srcreq []byte) {
 
 	_, err = c.Write(srcreq)
 	if err != nil {
+		gds.status.ExternFailnum++
 		loggo.Error("Write extern fail %v", err)
 		return
 	}
@@ -252,11 +307,14 @@ func forwardextern(srcaddr *net.UDPAddr, srcreq []byte) {
 	c.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(gds.timeout)))
 	n, err := c.Read(bytes)
 	if err != nil {
+		gds.status.ExternFailnum++
 		loggo.Info("ReadFromUDP extern fail %v", err)
 		return
 	}
 
 	loggo.Info("forward extern ret %v %v", srcaddr, gds.externalserveraddr)
+
+	gds.status.ExternRetnum++
 
 	go processret(true, srcaddr, srcreq, bytes[0:n])
 }
@@ -292,8 +350,13 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 				v, _ := gds.cache.LoadOrStore(host, &dnscache{})
 				dc := v.(*dnscache)
 				dc.host = host
-				dc.ip = ip
+				if extern {
+					dc.externip = ip
+				} else {
+					dc.ip = ip
+				}
 				dc.time = time.Now()
+				dc.fromextern = extern
 
 				region, _ := geoip.GetCountryIsoCode(ip)
 				if len(region) <= 0 {
@@ -327,4 +390,6 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 	}
 
 	loggo.Info("%v %v process ret ok", name, srcaddr)
+
+	gds.status.ResNum++
 }
