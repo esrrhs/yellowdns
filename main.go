@@ -39,7 +39,7 @@ func main() {
 	externalserver := flag.String("exs", "8.8.8.8:53", "external dns server")
 	localregion := flag.String("lor", "CN", "local region")
 	localregionfile := flag.String("lof", "GeoLite2-Country.mmdb", "local region file")
-	timeout := flag.Int("timeout", 5000, "wait timeout in ms")
+	timeout := flag.Int("timeout", 5000, "wait response timeout in ms")
 	expire := flag.Int("expire", 24, "host region cache expire time in hour")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
