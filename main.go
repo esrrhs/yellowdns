@@ -34,6 +34,7 @@ type dnsserverstatus struct {
 	ResNum        int
 	Packerror     int
 	Anum          int
+	ARetnum       int
 	ACachenum     int
 	Localnum      int
 	Externnum     int
@@ -231,7 +232,6 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 			dc := v.(*dnscache)
 			if dc.extern {
 				extern = true
-				break
 			}
 		}
 	}
@@ -343,6 +343,7 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 	if msg.Rcode == dns.RcodeSuccess {
 		for _, a := range msg.Answer {
 			if a.Header().Rrtype == dns.TypeA {
+				gds.status.ARetnum++
 				aa := a.(*dns.A)
 				ip := aa.A.String()
 				host := aa.Hdr.Name
