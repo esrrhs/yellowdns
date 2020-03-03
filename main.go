@@ -193,8 +193,8 @@ func updateCache() {
 			return true
 		})
 
-		loggo.Warn("\n%s%s", common.StuctToTable(&dcs),
-			common.StuctToTable(&(gds.status)))
+		loggo.Warn("\n%s%s", common.StructToTable(&dcs),
+			common.StructToTable(&(gds.status)))
 
 		for _, host := range tmpdelete {
 			gds.cache.Delete(host)
