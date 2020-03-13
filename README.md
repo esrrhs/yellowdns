@@ -22,4 +22,7 @@
 
 其他的选项，参考-h
 
-
+docker
+```
+docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
+```
