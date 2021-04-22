@@ -10,7 +10,10 @@
 ```
 ./yellowdns -l :53 -los 114.114.114.114:53 -exs 8.8.8.8:53 -lor CN -lof GeoLite2-Country.mmdb
 ```
-
+或者使用docker
+```
+docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
+```
 # 参数说明
 -l：监听的udp地址，默认53
 
@@ -23,8 +26,3 @@
 -lof: ip查询国家的数据库文件
 
 其他的选项，参考-h
-
-# docker
-```
-docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
-```
