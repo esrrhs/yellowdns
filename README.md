@@ -1,4 +1,13 @@
 # yellowdns
+
+[<img src="https://img.shields.io/github/license/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns)
+[<img src="https://img.shields.io/github/languages/top/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns)
+[![Go Report Card](https://goreportcard.com/badge/github.com/esrrhs/yellowdns)](https://goreportcard.com/report/github.com/esrrhs/yellowdns)
+[<img src="https://img.shields.io/github/v/release/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns/releases)
+[<img src="https://img.shields.io/github/downloads/esrrhs/yellowdns/total">](https://github.com/esrrhs/yellowdns/releases)
+[<img src="https://img.shields.io/docker/pulls/esrrhs/yellowdns">](https://hub.docker.com/repository/docker/esrrhs/yellowdns)
+[<img src="https://img.shields.io/github/workflow/status/esrrhs/yellowdns/Go">](https://github.com/esrrhs/yellowdns/actions)
+
 简单的dns proxy，根据地域转发到不同的dns server，解决访问境外dns的问题
 
 # 使用
