@@ -23,6 +23,8 @@
 ```
 docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
 ```
+如果提示53端口被占用，看看是不是其他网卡被占了，那么修改成127.0.0.1:53即可
+
 # 参数说明
 * -l：监听的udp地址，默认53
 
