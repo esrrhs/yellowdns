@@ -3,8 +3,8 @@ package main
 import (
 	"flag"
 	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/geoip"
 	"github.com/esrrhs/gohome/loggo"
+	"github.com/esrrhs/gohome/thirdparty"
 	"github.com/miekg/dns"
 	"net"
 	"sync"
@@ -128,7 +128,7 @@ func main() {
 	gds.externalserveraddr = externalserveraddr
 	loggo.Info("external dns server is %v", externalserveraddr)
 
-	err = geoip.Load(*localregionfile)
+	err = thirdparty.LoadGeoip2(*localregionfile)
 	if err != nil {
 		loggo.Error("load local region ip file ERROR: %v", err)
 		return
@@ -359,7 +359,7 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 				dc.time = time.Now()
 				dc.fromextern = extern
 
-				region, _ := geoip.GetCountryIsoCode(ip)
+				region, _ := thirdparty.GetGeoipCountryIsoCode(ip)
 				if len(region) <= 0 {
 					dc.extern = false
 				} else if gds.localregion == region {
