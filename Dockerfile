@@ -1,10 +1,14 @@
-FROM golang AS build-env
+FROM golang:1.27.1-bookworm AS build
 
-RUN GO111MODULE=off go get -u github.com/esrrhs/yellowdns
-RUN GO111MODULE=off go get -u github.com/esrrhs/yellowdns/...
-RUN GO111MODULE=off go install github.com/esrrhs/yellowdns
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /out/yellowdns .
 
-FROM debian
-COPY --from=build-env /go/bin/yellowdns .
-COPY GeoLite2-Country.mmdb .
-WORKDIR ./
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY --from=build /out/yellowdns ./yellowdns
+COPY GeoLite2-Country.mmdb ./GeoLite2-Country.mmdb
+EXPOSE 53/udp
+CMD ["./yellowdns"]

@@ -1,4 +1,4 @@
-name: Go
+name: Test
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -20,5 +20,5 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
-        run: go build -v ./...
+      - name: Unit test
+        run: go test -race -count=1 ./...

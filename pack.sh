@@ -7,8 +7,8 @@ export GO111MODULE=on
 #go tool dist list
 build_list=$(go tool dist list)
 
-rm pack -rf
-rm pack.zip -f
+rm -rf pack
+rm -f pack.zip
 mkdir pack
 
 for line in $build_list; do
