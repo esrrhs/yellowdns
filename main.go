@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/esrrhs/gohome/common"
+	gohomedns "github.com/esrrhs/gohome/dns"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/thirdparty"
 	"github.com/miekg/dns"
@@ -57,6 +59,7 @@ type dnsserver struct {
 	cache              sync.Map
 	localsereraddr     *net.UDPAddr
 	externalserveraddr *net.UDPAddr
+	resolver           gohomedns.Resolver
 }
 
 var gds dnsserver
@@ -66,6 +69,8 @@ func (s *dnsserver) incr(n *int) {
 	*n++
 	s.statusMu.Unlock()
 }
+
+var yellowdnsVersion = "0.4.0"
 
 func main() {
 	defer common.CrashLog()
@@ -82,8 +87,14 @@ func main() {
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	loglevel := flag.String("loglevel", "info", "log level")
+	showVersion := flag.Bool("version", false, "show version and exit")
 
 	flag.Parse()
+
+	if *showVersion {
+		println("yellowdns version " + yellowdnsVersion)
+		return
+	}
 
 	if *listen == "" || *localserer == "" ||
 		*externalserver == "" || *localregion == "" ||
@@ -150,6 +161,29 @@ func main() {
 		loggo.Error("load domain list %v", err)
 	}
 	loggo.Info("domain list china %d gfw %d", chinaN, gfwN)
+
+	cfg := gohomedns.DefaultConfig()
+	cfg.EnableFakeIP = false
+	if *localserer != "" {
+		cfg.DirectUpstreams = []string{*localserer}
+	}
+	if *externalserver != "" {
+		cfg.RemoteUpstreams = []string{*externalserver}
+	}
+	cfg.GeoIPFile = *localregionfile
+	if *chinaFile != "" {
+		cfg.DirectDomainFiles = []string{*chinaFile}
+	}
+	if *gfwFile != "" {
+		cfg.ProxyDomainFiles = []string{*gfwFile}
+	}
+	cfg.Timeout = time.Duration(*timeout) * time.Millisecond
+	res, err := gohomedns.NewResolver(cfg)
+	if err == nil {
+		gds.resolver = res
+	} else {
+		loggo.Warn("New gohome resolver error: %v, using default forwarder", err)
+	}
 
 	gds.localregion = *localregion
 
@@ -246,6 +280,21 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 		return
 	}
 	loggo.Info("dns Msg: \n%v", msg.String())
+
+	if gds.resolver != nil {
+		resp, err := gds.resolver.Exchange(context.Background(), &msg)
+		if err == nil && resp != nil {
+			respBytes, packErr := resp.Pack()
+			if packErr == nil {
+				_, writeErr := gds.listener.WriteToUDP(respBytes, srcaddr)
+				if writeErr == nil {
+					gds.incr(&gds.status.ResNum)
+					return
+				}
+			}
+		}
+		loggo.Warn("gohome resolver Exchange failed: %v, falling back to legacy router", err)
+	}
 
 	mode := routeAuto
 	for _, q := range msg.Question {
