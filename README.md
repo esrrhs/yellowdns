@@ -7,33 +7,57 @@
 [<img src="https://img.shields.io/github/downloads/esrrhs/yellowdns/total">](https://github.com/esrrhs/yellowdns/releases)
 [<img src="https://img.shields.io/docker/pulls/esrrhs/yellowdns">](https://hub.docker.com/repository/docker/esrrhs/yellowdns)
 [<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/yellowdns/go.yml?branch=master">](https://github.com/esrrhs/yellowdns/actions)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/yellowdns/test.yml?branch=master&label=test">](https://github.com/esrrhs/yellowdns/actions)
 
-简单的dns proxy，根据地域转发到不同的dns server，解决访问境外dns的问题
+DNS proxy that picks an upstream from the name and the country of the answer. Domestic names stay on a local resolver. Interfered names go straight to an external resolver.
 
-# 使用
-直接启动
+# Usage
+
 ```
 ./yellowdns
 ```
-等价于
+
+is the same as
+
 ```
 ./yellowdns -l :53 -los 114.114.114.114:53 -exs 8.8.8.8:53 -lor CN -lof GeoLite2-Country.mmdb
 ```
-或者使用docker
+
+Docker:
+
 ```
 docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
 ```
-如果提示53端口被占用，看看是不是其他网卡被占了，那么修改成127.0.0.1:53即可
 
-# 参数说明
-* -l：监听的udp地址，默认53
+If port 53 is already taken by another interface, listen on `127.0.0.1:53` instead.
 
-* -los: 境内的dns server，默认114.114.114.114:53，域名解析时，先走境内dns server，发现如果是境外ip，则再重新走境外的dns server
+# Flags
 
-* -exs：境外的dns server，默认8.8.8.8:53，境外的ip都用这个dns server做解析
+* `-l`: UDP listen address, default `:53`
+* `-los`: domestic DNS server, default `114.114.114.114:53`
+* `-exs`: external DNS server, default `8.8.8.8:53`
+* `-lor`: domestic region code, default `CN`
+* `-lof`: country database. The file shipped in this repo is DB-IP Country Lite
+* `-china`: extra domestic domain list. One domain per line, or dnsmasq `server=/name/address` lines
+* `-gfw`: extra interfered domain list, same format
+* other options: `./yellowdns -h`
 
-* -lor: 境内的定义，默认CN
+Routing order:
 
-* -lof: ip查询国家的数据库文件
+1. `.cn`, `.中国`, `.公司`, `.网络`, and the built-in domestic list go directly to the domestic DNS. A domestic name is not sent to the external DNS just because its address is on a foreign CDN.
+2. The built-in interfered list goes directly to the external DNS.
+3. A more specific domestic name wins over a blocked parent. `google.com` is external, while `adservice.google.com` stays domestic.
+4. Any other name is asked on the domestic DNS first. If an A or AAAA answer is outside the domestic region, the original query is sent to the external DNS.
 
-* 其他的选项，参考-h
+# Data
+
+The country database is [DB-IP](https://db-ip.com/) Country Lite, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Domestic names come from [dnsmasq-china-list](https://github.com/felixonmars/dnsmasq-china-list). Interfered names come from the gfw list in [v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat).
+
+# Release
+
+Push a version tag to build archives and publish them to GitHub Releases. Each zip contains the binary and `GeoLite2-Country.mmdb`.
+
+```
+git tag 0.3
+git push origin 0.3
+```

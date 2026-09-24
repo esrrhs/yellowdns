@@ -2,16 +2,18 @@ package main
 
 import (
 	"flag"
+	"net"
+	"sync"
+	"time"
+
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/thirdparty"
 	"github.com/miekg/dns"
-	"net"
-	"sync"
-	"time"
 )
 
 type dnscache struct {
+	mu         sync.Mutex
 	host       string
 	ip         string
 	externip   string
@@ -49,6 +51,7 @@ type dnsserver struct {
 	localregion string
 	timeout     int
 	expire      int
+	statusMu    sync.Mutex
 	status      dnsserverstatus
 
 	cache              sync.Map
@@ -57,6 +60,12 @@ type dnsserver struct {
 }
 
 var gds dnsserver
+
+func (s *dnsserver) incr(n *int) {
+	s.statusMu.Lock()
+	*n++
+	s.statusMu.Unlock()
+}
 
 func main() {
 	defer common.CrashLog()
@@ -68,6 +77,8 @@ func main() {
 	localregionfile := flag.String("lof", "GeoLite2-Country.mmdb", "local region file")
 	timeout := flag.Int("timeout", 5000, "wait response timeout in ms")
 	expire := flag.Int("expire", 24, "host region cache expire time in hour")
+	chinaFile := flag.String("china", "", "extra china domain list")
+	gfwFile := flag.String("gfw", "", "extra blocked domain list")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	loglevel := flag.String("loglevel", "info", "log level")
@@ -134,27 +145,32 @@ func main() {
 		return
 	}
 
+	chinaN, gfwN, err := loadDomainLists(*chinaFile, *gfwFile)
+	if err != nil {
+		loggo.Error("load domain list %v", err)
+	}
+	loggo.Info("domain list china %d gfw %d", chinaN, gfwN)
+
 	gds.localregion = *localregion
 
 	go updateCache()
 
+	buf := make([]byte, 4096)
 	for {
-		bytes := make([]byte, 4096)
-
 		loggo.Info("wait for udp in")
-		n, srcaddr, err := gds.listener.ReadFromUDP(bytes)
-		if err != nil {
+		n, srcaddr, err := gds.listener.ReadFromUDP(buf)
+		if err != nil || n <= 0 {
 			continue
 		}
-		if n <= 0 {
-			continue
-		}
+
+		req := make([]byte, n)
+		copy(req, buf[:n])
 
 		loggo.Info("recv udp %v from %v", n, srcaddr)
 
-		gds.status.Reqnum++
+		gds.incr(&gds.status.Reqnum)
 
-		go forward(srcaddr, bytes[0:n])
+		go forward(srcaddr, req)
 	}
 }
 
@@ -170,15 +186,23 @@ func updateCache() {
 			host := key.(string)
 			dc := value.(*dnscache)
 
-			if dc.fromextern {
+			dc.mu.Lock()
+			fromextern := dc.fromextern
+			externip := dc.externip
+			ip := dc.ip
+			isExtern := dc.extern
+			expired := time.Since(dc.time) > time.Hour*time.Duration(gds.expire)
+			dc.mu.Unlock()
+
+			if fromextern {
 				dcs.ExternDNS++
-				if dc.externip != dc.ip {
+				if externip != ip {
 					dcs.Extern_diff++
 				} else {
 					dcs.Extern_same++
 				}
 			} else {
-				if dc.extern {
+				if isExtern {
 					dcs.Local_extern++
 				} else {
 					dcs.Local_local++
@@ -186,22 +210,25 @@ func updateCache() {
 				dcs.LocalDNS++
 			}
 
-			if time.Now().Sub(dc.time) > time.Hour*time.Duration(gds.expire) {
+			if expired {
 				tmpdelete = append(tmpdelete, host)
 			}
 
 			return true
 		})
 
+		gds.statusMu.Lock()
+		status := gds.status
+		gds.status = dnsserverstatus{}
+		gds.statusMu.Unlock()
+
 		loggo.Warn("\n%s%s", common.StructToTable(&dcs),
-			common.StructToTable(&(gds.status)))
+			common.StructToTable(&status))
 
 		for _, host := range tmpdelete {
 			gds.cache.Delete(host)
 			loggo.Warn("delete expire cache %s", host)
 		}
-
-		gds.status = dnsserverstatus{}
 
 		time.Sleep(time.Minute)
 	}
@@ -214,52 +241,74 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 	msg := dns.Msg{}
 	err := msg.Unpack(srcreq)
 	if err != nil {
-		gds.status.Packerror++
+		gds.incr(&gds.status.Packerror)
 		loggo.Error("dns Msg Unpack fail %v", err)
 		return
 	}
 	loggo.Info("dns Msg: \n%v", msg.String())
 
-	extern := false
+	mode := routeAuto
 	for _, q := range msg.Question {
 		if q.Qtype == dns.TypeA {
-			gds.status.Anum++
+			gds.incr(&gds.status.Anum)
+		}
+		switch classifyName(q.Name) {
+		case routeExtern:
+			mode = routeExtern
+		case routeLocal:
+			if mode != routeExtern {
+				mode = routeLocal
+			}
+		}
+	}
+	if mode == routeAuto {
+		for _, q := range msg.Question {
+			if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
+				continue
+			}
 			v, ok := gds.cache.Load(q.Name)
 			if !ok {
 				continue
 			}
-			gds.status.ACachenum++
+			gds.incr(&gds.status.ACachenum)
 			dc := v.(*dnscache)
-			if dc.extern {
-				extern = true
+			dc.mu.Lock()
+			isExtern := dc.extern
+			dc.mu.Unlock()
+			if isExtern {
+				mode = routeExtern
+				break
 			}
 		}
 	}
 
-	if extern {
-		go forwardextern(srcaddr, srcreq)
+	loggo.Info("route %s", routeName(mode))
+
+	if mode == routeExtern {
+		go forwardextern(srcaddr, srcreq, mode)
 	} else {
-		go forwardlocal(srcaddr, srcreq)
+		go forwardlocal(srcaddr, srcreq, mode)
 	}
 }
 
-func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
+func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte, mode int) {
 	defer common.CrashLog()
 
-	gds.status.Localnum++
+	gds.incr(&gds.status.Localnum)
 
 	loggo.Info("forward local start %v %v", srcaddr, gds.localsereraddr)
 	c, err := net.DialUDP("udp", nil, gds.localsereraddr)
 	if err != nil {
-		gds.status.LocalFailnum++
+		gds.incr(&gds.status.LocalFailnum)
 		loggo.Error("DialUDP local fail %v", err)
 		return
 	}
+	defer c.Close()
 	loggo.Info("forward local dail ok %v %v", srcaddr, gds.localsereraddr)
 
 	_, err = c.Write(srcreq)
 	if err != nil {
-		gds.status.LocalFailnum++
+		gds.incr(&gds.status.LocalFailnum)
 		loggo.Error("Write local fail %v", err)
 		return
 	}
@@ -269,35 +318,36 @@ func forwardlocal(srcaddr *net.UDPAddr, srcreq []byte) {
 	c.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(gds.timeout)))
 	n, err := c.Read(bytes)
 	if err != nil {
-		gds.status.LocalFailnum++
+		gds.incr(&gds.status.LocalFailnum)
 		loggo.Info("ReadFromUDP local fail %v", err)
 		return
 	}
 
-	loggo.Info("forward local ret %v %v", srcaddr, gds.externalserveraddr)
+	loggo.Info("forward local ret %v %v", srcaddr, gds.localsereraddr)
 
-	gds.status.LocalRetnum++
+	gds.incr(&gds.status.LocalRetnum)
 
-	go processret(false, srcaddr, srcreq, bytes[0:n])
+	go processret(false, mode, srcaddr, srcreq, bytes[0:n])
 }
 
-func forwardextern(srcaddr *net.UDPAddr, srcreq []byte) {
+func forwardextern(srcaddr *net.UDPAddr, srcreq []byte, mode int) {
 	defer common.CrashLog()
 
-	gds.status.Externnum++
+	gds.incr(&gds.status.Externnum)
 
 	loggo.Info("forward extern start %v %v", srcaddr, gds.externalserveraddr)
 	c, err := net.DialUDP("udp", nil, gds.externalserveraddr)
 	if err != nil {
-		gds.status.ExternFailnum++
+		gds.incr(&gds.status.ExternFailnum)
 		loggo.Error("DialUDP extern fail %v", err)
 		return
 	}
+	defer c.Close()
 	loggo.Info("forward extern dail ok %v %v", srcaddr, gds.externalserveraddr)
 
 	_, err = c.Write(srcreq)
 	if err != nil {
-		gds.status.ExternFailnum++
+		gds.incr(&gds.status.ExternFailnum)
 		loggo.Error("Write extern fail %v", err)
 		return
 	}
@@ -307,19 +357,19 @@ func forwardextern(srcaddr *net.UDPAddr, srcreq []byte) {
 	c.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(gds.timeout)))
 	n, err := c.Read(bytes)
 	if err != nil {
-		gds.status.ExternFailnum++
+		gds.incr(&gds.status.ExternFailnum)
 		loggo.Info("ReadFromUDP extern fail %v", err)
 		return
 	}
 
 	loggo.Info("forward extern ret %v %v", srcaddr, gds.externalserveraddr)
 
-	gds.status.ExternRetnum++
+	gds.incr(&gds.status.ExternRetnum)
 
-	go processret(true, srcaddr, srcreq, bytes[0:n])
+	go processret(true, mode, srcaddr, srcreq, bytes[0:n])
 }
 
-func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte) {
+func processret(extern bool, mode int, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte) {
 	defer common.CrashLog()
 
 	name := ""
@@ -342,45 +392,47 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 	hasextern := false
 	if msg.Rcode == dns.RcodeSuccess {
 		for _, a := range msg.Answer {
+			host, ip, ok := answerIP(a)
+			if !ok {
+				continue
+			}
 			if a.Header().Rrtype == dns.TypeA {
-				gds.status.ARetnum++
-				aa := a.(*dns.A)
-				ip := aa.A.String()
-				host := aa.Hdr.Name
+				gds.incr(&gds.status.ARetnum)
+			}
 
-				v, _ := gds.cache.LoadOrStore(host, &dnscache{})
-				dc := v.(*dnscache)
-				dc.host = host
-				if extern {
-					dc.externip = ip
-				} else {
-					dc.ip = ip
-				}
-				dc.time = time.Now()
-				dc.fromextern = extern
+			region, _ := thirdparty.GetGeoipCountryIsoCode(ip)
+			isExtern := len(region) > 0 && gds.localregion != region
+			switch mode {
+			case routeLocal:
+				isExtern = false
+			case routeExtern:
+				isExtern = true
+			}
+			if isExtern {
+				hasextern = true
+			}
+			remember(host, ip, extern, isExtern)
 
-				region, _ := thirdparty.GetGeoipCountryIsoCode(ip)
-				if len(region) <= 0 {
-					dc.extern = false
-				} else if gds.localregion == region {
-					dc.extern = false
-				} else {
-					dc.extern = true
-					hasextern = true
-				}
-
-				if dc.extern {
-					loggo.Info("%v %v save extern dns cache: %v %v", name, srcaddr, host, ip)
-				} else {
-					loggo.Info("%v %v save local dns cache: %v %v", name, srcaddr, host, ip)
-				}
+			if isExtern {
+				loggo.Info("%v %v save extern dns cache: %v %v", name, srcaddr, host, ip)
+			} else {
+				loggo.Info("%v %v save local dns cache: %v %v", name, srcaddr, host, ip)
 			}
 		}
 	}
 
-	if !extern && hasextern {
+	if mode == routeAuto && hasextern {
+		req := dns.Msg{}
+		if err := req.Unpack(srcreq); err == nil {
+			for _, q := range req.Question {
+				remember(q.Name, "", extern, true)
+			}
+		}
+	}
+
+	if mode == routeAuto && !extern && hasextern {
 		loggo.Info("%v %v retry forward extern", name, srcaddr)
-		go forwardextern(srcaddr, srcreq)
+		go forwardextern(srcaddr, srcreq, routeAuto)
 		return
 	}
 
@@ -392,5 +444,43 @@ func processret(extern bool, srcaddr *net.UDPAddr, srcreq []byte, retdata []byte
 
 	loggo.Info("%v %v process ret ok", name, srcaddr)
 
-	gds.status.ResNum++
+	gds.incr(&gds.status.ResNum)
+}
+
+func answerIP(rr dns.RR) (string, string, bool) {
+	switch a := rr.(type) {
+	case *dns.A:
+		if a.A == nil {
+			return "", "", false
+		}
+		return a.Hdr.Name, a.A.String(), true
+	case *dns.AAAA:
+		if a.AAAA == nil {
+			return "", "", false
+		}
+		return a.Hdr.Name, a.AAAA.String(), true
+	default:
+		return "", "", false
+	}
+}
+
+func remember(host, ip string, fromextern, isExtern bool) {
+	if host == "" {
+		return
+	}
+	v, _ := gds.cache.LoadOrStore(host, &dnscache{})
+	dc := v.(*dnscache)
+	dc.mu.Lock()
+	dc.host = host
+	if ip != "" {
+		if fromextern {
+			dc.externip = ip
+		} else {
+			dc.ip = ip
+		}
+	}
+	dc.time = time.Now()
+	dc.fromextern = fromextern
+	dc.extern = isExtern
+	dc.mu.Unlock()
 }
