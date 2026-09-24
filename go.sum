@@ -2,8 +2,8 @@ github.com/OneOfOne/xxhash v1.2.8 h1:31czK/TI9sNkxIKfaUfGlU47BAxQ0ztGgd9vPyqimf8
 github.com/OneOfOne/xxhash v1.2.8/go.mod h1:eZbhyaAYD41SGSSsnmcpxVoRiQ/MPUTjUdIIOT9Um7Q=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/esrrhs/gohome v0.0.0-20260919145331-036124786531 h1:NbAbzbvx8wAFe8SOGrJk6K5haB7rTFaYr2cPNFI7tGI=
-github.com/esrrhs/gohome v0.0.0-20260919145331-036124786531/go.mod h1:cy8FF7iQPEoJV6rtSVPcqa2CiPd33pp3GQm3WU/93Sw=
+github.com/esrrhs/gohome v0.0.0-20260924051301-4210dd2c21f5 h1:Mnwn3u8/QTHumlg63m3KsALWpEiF8WfFW8TLTIF7ypA=
+github.com/esrrhs/gohome v0.0.0-20260924051301-4210dd2c21f5/go.mod h1:tRLY2j9CjI+uML7QckSSpQPs4Tgc+isNTf7g5TMyhLo=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
