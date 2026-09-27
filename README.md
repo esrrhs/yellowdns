@@ -2,14 +2,13 @@
 
 [<img src="https://img.shields.io/github/license/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns)
 [<img src="https://img.shields.io/github/languages/top/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns)
-[![Go Report Card](https://goreportcard.com/badge/github.com/esrrhs/yellowdns)](https://goreportcard.com/report/github.com/esrrhs/yellowdns)
 [<img src="https://img.shields.io/github/v/release/esrrhs/yellowdns">](https://github.com/esrrhs/yellowdns/releases)
 [<img src="https://img.shields.io/github/downloads/esrrhs/yellowdns/total">](https://github.com/esrrhs/yellowdns/releases)
 [<img src="https://img.shields.io/docker/pulls/esrrhs/yellowdns">](https://hub.docker.com/repository/docker/esrrhs/yellowdns)
 [<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/yellowdns/go.yml?branch=master">](https://github.com/esrrhs/yellowdns/actions)
 [<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/yellowdns/test.yml?branch=master&label=test">](https://github.com/esrrhs/yellowdns/actions)
 
-DNS proxy that picks an upstream from the name and the country of the answer. Domestic names stay on a local resolver. Interfered names go straight to an external resolver.
+Yellowdns is a DNS proxy that keeps domestic names on a local resolver and sends interfered names to an external resolver, based on the queried name and the country of the answer.
 
 # Usage
 
