@@ -17,6 +17,11 @@ targets=(
 rm -rf dist
 mkdir -p dist
 
+# GitHub Actions 中 GITHUB_REF_NAME 即触发发布的 tag；本地执行回退到 git describe。
+VERSION="${GITHUB_REF_NAME:-$(git describe --tags --always 2>/dev/null || echo dev)}"
+LDFLAGS="-s -w -X main.version=${VERSION}"
+echo "building version ${VERSION}"
+
 for target in "${targets[@]}"; do
   os="${target%/*}"
   arch="${target#*/}"
@@ -31,9 +36,9 @@ for target in "${targets[@]}"; do
 
   stage="$(mktemp -d)"
   if [ "$arch" = "arm" ]; then
-    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=7 go build -ldflags="-s -w" -o "$stage/yellowdns$ext" .
+    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM=7 go build -ldflags="$LDFLAGS" -o "$stage/yellowdns$ext" .
   else
-    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -ldflags="-s -w" -o "$stage/yellowdns$ext" .
+    CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -ldflags="$LDFLAGS" -o "$stage/yellowdns$ext" .
   fi
   cp GeoLite2-Country.mmdb "$stage/"
 
