@@ -3,7 +3,7 @@ module github.com/esrrhs/yellowdns
 go 1.27.1
 
 require (
-	github.com/esrrhs/gohome v0.0.0-20260924051301-4210dd2c21f5
+	github.com/esrrhs/gohome v0.0.0-20261008233426-8124be7601dc
 	github.com/miekg/dns v1.1.73
 	github.com/oschwald/maxminddb-golang v1.13.1
 	golang.org/x/net v0.59.0

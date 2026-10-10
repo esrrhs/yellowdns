@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	gohomedns "github.com/esrrhs/gohome/dns"
 	"golang.org/x/net/idna"
 )
 
@@ -31,6 +32,9 @@ type domainSet map[string]struct{}
 var (
 	chinaDomains domainSet
 	gfwDomains   domainSet
+	// externShadowed 中的 gfw 域名（或其父域）同时存在于直连规则中，
+	// gohome resolver 直连优先的 trie 语义会把它们错误放行，必须绕开 resolver。
+	externShadowed domainSet
 )
 
 func loadDomainLists(chinaFile, gfwFile string) (int, int, error) {
@@ -46,15 +50,68 @@ func loadDomainLists(chinaFile, gfwFile string) (int, int, error) {
 	if chinaFile != "" {
 		err = loadFile(chinaDomains, chinaFile)
 	}
-	if gfwFile != "" {
-		if e := loadFile(gfwDomains, gfwFile); err == nil {
-			err = e
-		}
+	if gfwFile != "" && err == nil {
+		err = loadFile(gfwDomains, gfwFile)
 	}
 	for name := range gfwDomains {
 		delete(chinaDomains, name)
 	}
+	buildExternShadowed()
 	return len(chinaDomains), len(gfwDomains), err
+}
+
+// buildExternShadowed 计算会被 gohome 直连域名树遮蔽的 gfw 域名。
+// 遮蔽来源包括内置 china 列表以及 gohome 强制内置的默认 TLD 与主干域名。
+func buildExternShadowed() {
+	externShadowed = domainSet{}
+	direct := domainSet{}
+	for _, tld := range gohomedns.DefaultDirectTLDs {
+		direct[normalizeName(tld)] = struct{}{}
+	}
+	for _, d := range gohomedns.DefaultChinaMainDomains {
+		direct[normalizeName(d)] = struct{}{}
+	}
+	for d := range chinaDomains {
+		direct[d] = struct{}{}
+	}
+	for g := range gfwDomains {
+		cur := g
+		for {
+			if _, ok := direct[cur]; ok {
+				externShadowed[g] = struct{}{}
+				break
+			}
+			parent, ok := parentDomain(cur)
+			if !ok {
+				break
+			}
+			cur = parent
+		}
+	}
+}
+
+// externShadowedHit 判断 name 自身或其父域是否为被遮蔽的 gfw 域名
+func externShadowedHit(name string) bool {
+	cur := normalizeName(name)
+	for cur != "" {
+		if _, ok := externShadowed[cur]; ok {
+			return true
+		}
+		parent, ok := parentDomain(cur)
+		if !ok {
+			return false
+		}
+		cur = parent
+	}
+	return false
+}
+
+func domainKeys(set domainSet) []string {
+	keys := make([]string, 0, len(set))
+	for name := range set {
+		keys = append(keys, name)
+	}
+	return keys
 }
 
 func loadEmbed(set domainSet, name string) error {

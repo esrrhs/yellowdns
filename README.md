@@ -33,8 +33,8 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 # Flags
 
 * `-l`: UDP listen address, default `:53`
-* `-los`: domestic DNS server, default `114.114.114.114:53`
-* `-exs`: external DNS server, default `8.8.8.8:53`
+* `-los`: domestic DNS server, default `114.114.114.114:53`. Plain `host:port` uses UDP, `tcp://host:port` forces TCP, and `https://host/dns-query` uses DoH
+* `-exs`: external DNS server, default `8.8.8.8:53`, same address formats as `-los`
 * `-lor`: domestic region code, default `CN`
 * `-lof`: country database. The file shipped in this repo is DB-IP Country Lite
 * `-china`: extra domestic domain list. One domain per line, or dnsmasq `server=/name/address` lines
@@ -44,11 +44,11 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 
 Features & Routing:
 
-* **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries and GeoIP anti-poisoning validation.
+* **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries, response caching and GeoIP anti-poisoning validation. The embedded domestic/interfered lists are loaded straight into the resolver.
 * **Routing Priority**:
   1. `.cn`, `.中国`, `.公司`, `.网络`, and the built-in domestic list go directly to the domestic DNS. A domestic name is not sent to the external DNS just because its address is on a foreign CDN.
   2. The built-in interfered list goes directly to the external DNS.
-  3. A more specific domestic name wins over a blocked parent. `google.com` is external, while `adservice.google.com` stays domestic.
+  3. A more specific domestic name wins over a blocked parent. `google.com` is external, while `adservice.google.com` stays domestic. The reverse conflict (a blocked name under a domestic parent, such as `api.recaptcha.net` under `recaptcha.net`) is forced to the external path as well.
   4. Any other name is queried using parallel dual-stack racing. If the domestic answer is poisoned or outside the domestic region, the secure external response is automatically preferred.
 
 # Data
