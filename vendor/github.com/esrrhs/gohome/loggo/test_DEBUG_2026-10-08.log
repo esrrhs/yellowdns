@@ -1,0 +1,2 @@
+[DEBUG] [2026-10-08T22:16:29.163167+08:00] [loggo_test.go:108] [github.com/esrrhs/gohome/loggo.TestSetPrinter] printer test message 42
+[DEBUG] [2026-10-08T22:24:21.376193+08:00] [loggo_test.go:108] [github.com/esrrhs/gohome/loggo.TestSetPrinter] printer test message 42

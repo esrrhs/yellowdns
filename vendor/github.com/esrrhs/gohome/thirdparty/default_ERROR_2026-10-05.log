@@ -1,0 +1,54 @@
+[ERROR] [2026-10-05T00:18:12.099965+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T00:18:12.100465+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T00:18:12.100588+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T00:18:12.100706+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T00:18:12.100889+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T00:18:12.101002+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T00:18:12.101193+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T00:18:12.101322+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T00:18:12.101448+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T00:18:12.101554+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T00:18:12.101657+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T00:18:12.101763+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T00:18:12.101881+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T00:18:12.101985+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T00:18:12.102087+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T00:18:12.102189+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T00:18:12.102299+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T00:18:12.102461+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T00:18:12.10259+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T00:18:12.102727+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T00:18:12.102854+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T00:18:12.103034+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T00:18:12.103148+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T00:18:12.103316+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T00:18:12.103795+08:00] [tmysql.go:205] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql Query fail boom
+[ERROR] [2026-10-05T00:18:12.103973+08:00] [tmysql.go:237] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Query fail boom
+[ERROR] [2026-10-05T00:18:12.104168+08:00] [tmysql.go:312] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql Scan fail sql: expected 1 destination arguments in Scan, not 2
+[ERROR] [2026-10-05T08:03:26.304502+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T08:03:26.306604+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T08:03:26.306851+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T08:03:26.307097+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: Load() must be called first
+[ERROR] [2026-10-05T08:03:26.307493+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T08:03:26.307679+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T08:03:26.30784+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T08:03:26.307998+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a;b"
+[ERROR] [2026-10-05T08:03:26.308186+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T08:03:26.308478+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T08:03:26.308669+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T08:03:26.308832+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a b"
+[ERROR] [2026-10-05T08:03:26.309017+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T08:03:26.30918+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T08:03:26.309332+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T08:03:26.309483+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name ""
+[ERROR] [2026-10-05T08:03:26.309651+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T08:03:26.309814+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T08:03:26.309975+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T08:03:26.310142+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "a'b"
+[ERROR] [2026-10-05T08:03:26.310324+08:00] [tmysql.go:199] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql GetSize fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T08:03:26.310485+08:00] [tmysql.go:230] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Has fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T08:03:26.310983+08:00] [tmysql.go:274] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Last] TMysql Last fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T08:03:26.311278+08:00] [tmysql.go:297] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql FindValue fail tmysql: invalid table name "x`y"
+[ERROR] [2026-10-05T08:03:26.312457+08:00] [tmysql.go:205] [github.com/esrrhs/gohome/thirdparty.(*TMysql).GetSize] TMysql Query fail boom
+[ERROR] [2026-10-05T08:03:26.312686+08:00] [tmysql.go:237] [github.com/esrrhs/gohome/thirdparty.(*TMysql).Has] TMysql Query fail boom
+[ERROR] [2026-10-05T08:03:26.313148+08:00] [tmysql.go:312] [github.com/esrrhs/gohome/thirdparty.(*TMysql).FindValue] TMysql Scan fail sql: expected 1 destination arguments in Scan, not 2

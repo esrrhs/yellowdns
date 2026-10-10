@@ -10,5 +10,5 @@ FROM debian:bookworm-slim
 WORKDIR /app
 COPY --from=build /out/yellowdns ./yellowdns
 COPY GeoLite2-Country.mmdb ./GeoLite2-Country.mmdb
-EXPOSE 53/udp
+EXPOSE 53/udp 53/tcp
 CMD ["./yellowdns"]

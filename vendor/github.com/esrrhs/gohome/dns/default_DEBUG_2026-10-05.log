@@ -1,0 +1,42 @@
+[INFO] [2026-10-05T00:11:12.768368+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:53009 (udp+tcp)
+[INFO] [2026-10-05T00:11:12.770124+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:53281 (udp+tcp)
+[DEBUG] [2026-10-05T00:11:12.770806+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T00:11:12.770921+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T00:11:12.771317+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:54240 (udp+tcp)
+[INFO] [2026-10-05T00:11:23.659779+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:63807 (udp+tcp)
+[INFO] [2026-10-05T00:11:23.662341+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:49487 (udp+tcp)
+[DEBUG] [2026-10-05T00:11:23.663111+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T00:11:23.663221+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T00:11:23.663654+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:61467 (udp+tcp)
+[WARN] [2026-10-05T00:13:16.79979+08:00] [resolver.go:210] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[WARN] [2026-10-05T00:13:52.059469+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[WARN] [2026-10-05T00:14:28.788177+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-05T00:14:28.789863+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:65434 (udp+tcp)
+[INFO] [2026-10-05T00:14:28.790737+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:50319 (udp+tcp)
+[DEBUG] [2026-10-05T00:14:28.791193+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T00:14:28.791343+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T00:14:28.791589+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:65407 (udp+tcp)
+[WARN] [2026-10-05T00:18:02.257368+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-05T00:18:02.258221+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:58971 (udp+tcp)
+[INFO] [2026-10-05T00:18:02.258858+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:62051 (udp+tcp)
+[DEBUG] [2026-10-05T00:18:02.259096+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T00:18:02.25914+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T00:18:02.259343+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:64320 (udp+tcp)
+[WARN] [2026-10-05T07:53:51.590924+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-05T07:53:51.593813+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:60257 (udp+tcp)
+[INFO] [2026-10-05T07:53:51.594937+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:62547 (udp+tcp)
+[DEBUG] [2026-10-05T07:53:51.595355+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T07:53:51.595449+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T07:53:51.595758+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:61824 (udp+tcp)
+[WARN] [2026-10-05T07:59:46.105465+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-05T07:59:46.108315+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:59817 (udp+tcp)
+[INFO] [2026-10-05T07:59:46.109156+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:57056 (udp+tcp)
+[DEBUG] [2026-10-05T07:59:46.109707+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T07:59:46.109808+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T07:59:46.110084+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:63650 (udp+tcp)
+[WARN] [2026-10-05T08:01:49.41917+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-05T08:01:49.420568+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:50486 (udp+tcp)
+[INFO] [2026-10-05T08:01:49.421829+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:51289 (udp+tcp)
+[DEBUG] [2026-10-05T08:01:49.422682+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-05T08:01:49.423062+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-05T08:01:49.423443+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:54878 (udp+tcp)

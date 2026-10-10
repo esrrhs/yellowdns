@@ -91,6 +91,20 @@ func TestLoadDomainListsMissingFile(t *testing.T) {
 	}
 }
 
+func TestWithPort(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"114.114.114.114", "114.114.114.114:53"},
+		{"114.114.114.114:53", "114.114.114.114:53"},
+		{"::1", "[::1]:53"},
+		{"[::1]:5353", "[::1]:5353"},
+	}
+	for _, c := range cases {
+		if got := withPort(c.in); got != c.want {
+			t.Errorf("withPort(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestCountryDB(t *testing.T) {
 	db, err := maxminddb.Open("GeoLite2-Country.mmdb")
 	if err != nil {
