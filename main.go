@@ -70,7 +70,7 @@ func (s *dnsserver) incr(n *int) {
 	s.statusMu.Unlock()
 }
 
-var yellowdnsVersion = "0.4.0"
+var yellowdnsVersion = "0.4.1"
 
 func main() {
 	defer common.CrashLog()
@@ -171,6 +171,8 @@ func main() {
 		cfg.RemoteUpstreams = []string{*externalserver}
 	}
 	cfg.GeoIPFile = *localregionfile
+	cfg.DirectDomains = domainKeys(chinaDomains)
+	cfg.ProxyDomains = domainKeys(gfwDomains)
 	if *chinaFile != "" {
 		cfg.DirectDomainFiles = []string{*chinaFile}
 	}
@@ -181,6 +183,7 @@ func main() {
 	res, err := gohomedns.NewResolver(cfg)
 	if err == nil {
 		gds.resolver = res
+		loggo.Info("gohome resolver ready, %d shadowed extern names bypass it", len(externShadowed))
 	} else {
 		loggo.Warn("New gohome resolver error: %v, using default forwarder", err)
 	}
@@ -281,7 +284,28 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 	}
 	loggo.Info("dns Msg: \n%v", msg.String())
 
-	if gds.resolver != nil {
+	mode := routeAuto
+	shadowed := false
+	for _, q := range msg.Question {
+		if q.Qtype == dns.TypeA {
+			gds.incr(&gds.status.Anum)
+		}
+		switch classifyName(q.Name) {
+		case routeExtern:
+			mode = routeExtern
+			if externShadowedHit(q.Name) {
+				shadowed = true
+			}
+		case routeLocal:
+			if mode != routeExtern {
+				mode = routeLocal
+			}
+		}
+	}
+
+	// gohome 的直连域名树优先于代理树，少数被直连父域遮蔽的 gfw
+	// 域名会被它错误放行，这些名字直接走旧的境外转发。
+	if gds.resolver != nil && !(mode == routeExtern && shadowed) {
 		resp, err := gds.resolver.Exchange(context.Background(), &msg)
 		if err == nil && resp != nil {
 			respBytes, packErr := resp.Pack()
@@ -295,21 +319,10 @@ func forward(srcaddr *net.UDPAddr, srcreq []byte) {
 		}
 		loggo.Warn("gohome resolver Exchange failed: %v, falling back to legacy router", err)
 	}
-
-	mode := routeAuto
-	for _, q := range msg.Question {
-		if q.Qtype == dns.TypeA {
-			gds.incr(&gds.status.Anum)
-		}
-		switch classifyName(q.Name) {
-		case routeExtern:
-			mode = routeExtern
-		case routeLocal:
-			if mode != routeExtern {
-				mode = routeLocal
-			}
-		}
+	if mode == routeExtern && shadowed {
+		loggo.Info("shadowed extern name, bypass gohome resolver")
 	}
+
 	if mode == routeAuto {
 		for _, q := range msg.Question {
 			if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
