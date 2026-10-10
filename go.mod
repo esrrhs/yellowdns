@@ -9,6 +9,10 @@ require (
 	golang.org/x/net v0.59.0
 )
 
+// gohome 未发布 RegionCode 改动前的临时本地替换；
+// gohome 推送新版本后可移除本行并重新 go mod vendor。
+replace github.com/esrrhs/gohome => ../gohome
+
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect

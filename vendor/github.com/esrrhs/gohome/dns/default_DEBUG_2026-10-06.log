@@ -1,0 +1,12 @@
+[WARN] [2026-10-06T18:48:53.825713+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-06T18:48:53.855222+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:56537 (udp+tcp)
+[INFO] [2026-10-06T18:48:53.869689+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:51867 (udp+tcp)
+[DEBUG] [2026-10-06T18:48:53.886323+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-06T18:48:53.888846+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-06T18:48:53.892527+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:50755 (udp+tcp)
+[WARN] [2026-10-06T19:48:47.290592+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[INFO] [2026-10-06T19:48:47.297555+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:51528 (udp+tcp)
+[INFO] [2026-10-06T19:48:47.300168+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:63266 (udp+tcp)
+[DEBUG] [2026-10-06T19:48:47.30209+08:00] [server.go:179] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] udp shutdown: dns: server not started
+[DEBUG] [2026-10-06T19:48:47.302643+08:00] [server.go:185] [github.com/esrrhs/gohome/dns.(*Server).shutdownLocked] [DNS Server] tcp shutdown: dns: server not started
+[INFO] [2026-10-06T19:48:47.30362+08:00] [server.go:160] [github.com/esrrhs/gohome/dns.(*Server).Start] [DNS Server] Listening on 127.0.0.1:51332 (udp+tcp)

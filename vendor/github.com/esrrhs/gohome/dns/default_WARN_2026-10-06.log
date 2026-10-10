@@ -1,0 +1,2 @@
+[WARN] [2026-10-06T18:48:53.825713+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
+[WARN] [2026-10-06T19:48:47.290592+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"

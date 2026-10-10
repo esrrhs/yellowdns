@@ -25,17 +25,17 @@ is the same as
 Docker:
 
 ```
-docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
+docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp -p 55353:55353/tcp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
 ```
 
 If port 53 is already taken by another interface, listen on `127.0.0.1:53` instead.
 
 # Flags
 
-* `-l`: UDP listen address, default `:53`
+* `-l`: listen address serving both UDP and TCP, default `:53`
 * `-los`: domestic DNS server, default `114.114.114.114:53`. Plain `host:port` uses UDP, `tcp://host:port` forces TCP, and `https://host/dns-query` uses DoH
 * `-exs`: external DNS server, default `8.8.8.8:53`, same address formats as `-los`
-* `-lor`: domestic region code, default `CN`
+* `-lor`: domestic region code, default `CN`. Answers from the domestic DNS whose IPs fall outside this region are treated as suspect and the external answer is preferred instead
 * `-lof`: country database. The file shipped in this repo is DB-IP Country Lite
 * `-china`: extra domestic domain list. One domain per line, or dnsmasq `server=/name/address` lines
 * `-gfw`: extra interfered domain list, same format
@@ -44,6 +44,7 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 
 Features & Routing:
 
+* **UDP + TCP Listening**: Large answers that exceed the UDP size limit are served over TCP as required by RFC 1035.
 * **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries, response caching and GeoIP anti-poisoning validation. The embedded domestic/interfered lists are loaded straight into the resolver.
 * **Routing Priority**:
   1. `.cn`, `.中国`, `.公司`, `.网络`, and the built-in domestic list go directly to the domestic DNS. A domestic name is not sent to the external DNS just because its address is on a foreign CDN.
