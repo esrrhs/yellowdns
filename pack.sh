@@ -4,6 +4,10 @@ NAME="yellowdns"
 
 export GO111MODULE=on
 
+VERSION="$(git describe --tags --always 2>/dev/null || echo dev)"
+LDFLAGS="-s -w -X main.version=${VERSION}"
+echo "build version ${VERSION}"
+
 #go tool dist list
 build_list=$(go tool dist list)
 
@@ -24,7 +28,7 @@ for line in $build_list; do
   if [ $arch == "wasm" ]; then
     continue
   fi
-  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w"
+  CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="$LDFLAGS"
   if [ $? -ne 0 ]; then
     echo "os="$os" arch="$arch" build fail"
     exit 1

@@ -60,9 +60,9 @@ The country database is [DB-IP](https://db-ip.com/) Country Lite, licensed under
 
 # Release
 
-Push a version tag to build archives and publish them to GitHub Releases. Each zip contains the binary and `GeoLite2-Country.mmdb`.
+Push a version tag to build archives and publish them to GitHub Releases. Each zip contains the binary (with the tag baked in via `-X main.version`, shown by `-version`) and `GeoLite2-Country.mmdb`.
 
 ```
-git tag 0.3
-git push origin 0.3
+git tag 0.5
+git push origin 0.5
 ```

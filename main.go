@@ -15,7 +15,9 @@ import (
 	"github.com/miekg/dns"
 )
 
-var yellowdnsVersion = "0.5.0"
+// version 由发布构建通过 -ldflags "-X main.version=<tag>" 注入；
+// 本地 go build 无注入时显示 dev。
+var version = "dev"
 
 // defaultExternalUpstreams 境外上游默认走 DoH：
 // 明文 UDP 查询本身就会被中间设备注入伪造应答，加密查询从源头避免。
@@ -210,7 +212,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		println("yellowdns version " + yellowdnsVersion)
+		println("yellowdns version " + version)
 		return
 	}
 
@@ -232,7 +234,7 @@ func main() {
 		NoLogFile: *nolog > 0,
 		NoPrint:   *noprint > 0,
 	})
-	loggo.Info("start yellowdns %s", yellowdnsVersion)
+	loggo.Info("start yellowdns %s", version)
 
 	timeoutD := time.Duration(*timeout) * time.Millisecond
 
