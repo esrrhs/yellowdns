@@ -105,6 +105,50 @@ func TestWithPort(t *testing.T) {
 	}
 }
 
+func TestSplitUpstreams(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"8.8.8.8:53", []string{"8.8.8.8:53"}},
+		{"https://1.1.1.1/dns-query, https://8.8.8.8/dns-query", []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"}},
+		{" , a:53 ,, ", []string{"a:53"}},
+		{" , , ", nil},
+	}
+	for _, c := range cases {
+		got := splitUpstreams(c.in)
+		if len(got) != len(c.want) {
+			t.Fatalf("splitUpstreams(%q) = %v, want %v", c.in, got, c.want)
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Fatalf("splitUpstreams(%q) = %v, want %v", c.in, got, c.want)
+			}
+		}
+	}
+}
+
+func TestUpstreamFor(t *testing.T) {
+	u, err := upstreamFor("https://1.1.1.1/dns-query", time.Second)
+	if err != nil || u == nil {
+		t.Fatalf("DoH upstream: %v", err)
+	}
+	s := newSocketClient("114.114.114.114", time.Second)
+	if s.addr != "114.114.114.114:53" || s.network != "udp" {
+		t.Fatalf("socket client: %+v", s)
+	}
+	s2 := newSocketClient("tcp://1.2.3.4", time.Second)
+	if s2.addr != "1.2.3.4:53" || s2.network != "tcp" {
+		t.Fatalf("tcp client: %+v", s2)
+	}
+	if _, err := buildUpstreams(" , ", time.Second); err == nil {
+		t.Error("empty list should error")
+	}
+	if _, err := buildUpstreams("8.8.8.8,https://1.1.1.1/dns-query", time.Second); err != nil {
+		t.Fatalf("mixed list: %v", err)
+	}
+}
+
 func TestCountryDB(t *testing.T) {
 	db, err := maxminddb.Open("GeoLite2-Country.mmdb")
 	if err != nil {
