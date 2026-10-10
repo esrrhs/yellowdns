@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 	"time"
 
@@ -34,16 +35,66 @@ func TestClassifyEmbedded(t *testing.T) {
 }
 
 func TestClassifySpecificChinaWins(t *testing.T) {
-	chinaDomains = domainSet{}
-	gfwDomains = domainSet{}
-	addDomain(gfwDomains, "google.com")
-	addDomain(chinaDomains, "adservice.google.com")
+	china := domainSet{}
+	gfw := domainSet{}
+	addDomain(gfw, "google.com")
+	addDomain(china, "adservice.google.com")
+	domainState.Store(&domainData{
+		china:    china,
+		gfw:      gfw,
+		shadowed: buildExternShadowed(china, gfw),
+	})
 	if got := classifyName("adservice.google.com."); got != routeLocal {
 		t.Fatalf("specific china domain got %s", routeName(got))
 	}
 	if got := classifyName("www.google.com."); got != routeExtern {
 		t.Fatalf("parent gfw domain got %s", routeName(got))
 	}
+	if _, _, err := loadDomainLists("", ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReloadPicksUpExtraFile(t *testing.T) {
+	if _, _, err := loadDomainLists("", ""); err != nil {
+		t.Fatal(err)
+	}
+	name := "reload-test-domain.example"
+	if got := classifyName(name); got != routeAuto {
+		t.Fatalf("%s before reload got %s, want auto", name, routeName(got))
+	}
+
+	f, err := os.CreateTemp("", "china-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(name + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	r := &routingResolver{} // inner 为 nil：只验证规则快照热替换
+	cn, _, err := r.reload(f.Name(), "", "GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cn == 0 {
+		t.Fatal("reloaded china count should include embedded list")
+	}
+	if got := classifyName(name + "."); got != routeLocal {
+		t.Fatalf("%s after reload got %s, want local", name, routeName(got))
+	}
+
+	// 坏文件不能破坏现有快照
+	before := currentDomains()
+	if _, _, err := r.reload("/no/such/file", "", ""); err == nil {
+		t.Fatal("missing file should fail reload")
+	}
+	if currentDomains() != before {
+		t.Fatal("failed reload must keep the previous snapshot")
+	}
+
 	if _, _, err := loadDomainLists("", ""); err != nil {
 		t.Fatal(err)
 	}

@@ -171,6 +171,26 @@ func exchangeOne(ctx context.Context, u exchangeClient, req *dns.Msg, timeout ti
 	return u.Exchange(callCtx, req)
 }
 
+// reload 重新加载内置与外部域名列表、热替换 resolver 的分流树与 GeoIP 库，
+// 并清空响应缓存，使新规则对下一次查询立即生效。列表文件读取失败时保留旧状态。
+func (r *routingResolver) reload(chinaFile, gfwFile, geoFile string) (chinaN, gfwN int, err error) {
+	chinaN, gfwN, err = loadDomainLists(chinaFile, gfwFile)
+	if err != nil {
+		return 0, 0, err
+	}
+	d := currentDomains()
+	if r.inner != nil {
+		r.inner.UpdateDirectDomains(domainKeys(d.china))
+		r.inner.UpdateProxyDomains(domainKeys(d.gfw))
+		if e := r.inner.ReloadGeoIPDatabase(geoFile); e != nil {
+			loggo.Warn("reload geoip database fail %v", e)
+		}
+		// 已缓存的应答不会重新经过分流判定，清掉以免旧路由残留到 TTL 到期。
+		r.inner.ClearCache()
+	}
+	return chinaN, gfwN, nil
+}
+
 func main() {
 	defer common.CrashLog()
 
@@ -221,7 +241,8 @@ func main() {
 		loggo.Error("load domain list %v", err)
 		return
 	}
-	loggo.Info("domain list china %d gfw %d, shadowed extern %d", chinaN, gfwN, len(externShadowed))
+	doms := currentDomains()
+	loggo.Info("domain list china %d gfw %d, shadowed extern %d", chinaN, gfwN, len(doms.shadowed))
 
 	localAddrs := splitUpstreams(*localserer)
 	externalAddrs := splitUpstreams(*externalserver)
@@ -237,8 +258,8 @@ func main() {
 	cfg.RemoteUpstreams = externalAddrs
 	cfg.GeoIPFile = *localregionfile
 	cfg.RegionCode = *localregion
-	cfg.DirectDomains = domainKeys(chinaDomains)
-	cfg.ProxyDomains = domainKeys(gfwDomains)
+	cfg.DirectDomains = domainKeys(doms.china)
+	cfg.ProxyDomains = domainKeys(doms.gfw)
 	if *chinaFile != "" {
 		cfg.DirectDomainFiles = []string{*chinaFile}
 	}
@@ -277,5 +298,21 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
-	select {}
+	done := make(chan struct{})
+	setupSignalHandler(
+		func() {
+			cn, gfw, e := rr.reload(*chinaFile, *gfwFile, *localregionfile)
+			if e != nil {
+				loggo.Error("reload fail, keep old rules: %v", e)
+				return
+			}
+			loggo.Info("reload ok china %d gfw %d shadowed %d", cn, gfw, len(currentDomains().shadowed))
+		},
+		func() {
+			loggo.Info("stopping...")
+			_ = srv.Stop()
+			close(done)
+		},
+	)
+	<-done
 }
