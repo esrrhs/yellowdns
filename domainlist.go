@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	gohomedns "github.com/esrrhs/gohome/dns"
 	"golang.org/x/net/idna"
@@ -29,41 +30,62 @@ var cnSuffixes = []string{
 
 type domainSet map[string]struct{}
 
-var (
-	chinaDomains domainSet
-	gfwDomains   domainSet
-	// externShadowed 中的 gfw 域名（或其父域）同时存在于直连规则中，
+// domainData 是域名规则某一时刻的不可变快照。
+// 热重载整体替换快照（atomic.Pointer），查询路径无锁读取，避免数据竞争。
+type domainData struct {
+	china domainSet
+	gfw   domainSet
+	// shadowed 中的 gfw 域名（或其父域）同时存在于直连规则中，
 	// gohome resolver 直连优先的 trie 语义会把它们错误放行，必须绕开 resolver。
-	externShadowed domainSet
-)
+	shadowed domainSet
+}
+
+// 启动前为空快照，保证未加载列表时 currentDomains 也不返回 nil。
+var domainState = atomic.Pointer[domainData]{}
+
+func currentDomains() *domainData {
+	d := domainState.Load()
+	if d == nil {
+		return &domainData{china: domainSet{}, gfw: domainSet{}, shadowed: domainSet{}}
+	}
+	return d
+}
 
 func loadDomainLists(chinaFile, gfwFile string) (int, int, error) {
-	chinaDomains = domainSet{}
-	gfwDomains = domainSet{}
-	if err := loadEmbed(chinaDomains, "data/china.txt"); err != nil {
+	china := domainSet{}
+	gfw := domainSet{}
+	if err := loadEmbed(china, "data/china.txt"); err != nil {
 		return 0, 0, err
 	}
-	if err := loadEmbed(gfwDomains, "data/gfw.txt"); err != nil {
-		return len(chinaDomains), 0, err
+	if err := loadEmbed(gfw, "data/gfw.txt"); err != nil {
+		return len(china), 0, err
 	}
 	var err error
 	if chinaFile != "" {
-		err = loadFile(chinaDomains, chinaFile)
+		err = loadFile(china, chinaFile)
 	}
 	if gfwFile != "" && err == nil {
-		err = loadFile(gfwDomains, gfwFile)
+		err = loadFile(gfw, gfwFile)
 	}
-	for name := range gfwDomains {
-		delete(chinaDomains, name)
+	if err != nil {
+		// 文件加载失败时保留旧快照，调用方按错误处理（启动退出/重载放弃）。
+		return len(china), len(gfw), err
 	}
-	buildExternShadowed()
-	return len(chinaDomains), len(gfwDomains), err
+	for name := range gfw {
+		delete(china, name)
+	}
+	domainState.Store(&domainData{
+		china:    china,
+		gfw:      gfw,
+		shadowed: buildExternShadowed(china, gfw),
+	})
+	return len(china), len(gfw), nil
 }
 
 // buildExternShadowed 计算会被 gohome 直连域名树遮蔽的 gfw 域名。
 // 遮蔽来源包括内置 china 列表以及 gohome 强制内置的默认 TLD 与主干域名。
-func buildExternShadowed() {
-	externShadowed = domainSet{}
+func buildExternShadowed(china, gfw domainSet) domainSet {
+	shadowed := domainSet{}
 	direct := domainSet{}
 	for _, tld := range gohomedns.DefaultDirectTLDs {
 		direct[normalizeName(tld)] = struct{}{}
@@ -71,14 +93,14 @@ func buildExternShadowed() {
 	for _, d := range gohomedns.DefaultChinaMainDomains {
 		direct[normalizeName(d)] = struct{}{}
 	}
-	for d := range chinaDomains {
+	for d := range china {
 		direct[d] = struct{}{}
 	}
-	for g := range gfwDomains {
+	for g := range gfw {
 		cur := g
 		for {
 			if _, ok := direct[cur]; ok {
-				externShadowed[g] = struct{}{}
+				shadowed[g] = struct{}{}
 				break
 			}
 			parent, ok := parentDomain(cur)
@@ -88,13 +110,15 @@ func buildExternShadowed() {
 			cur = parent
 		}
 	}
+	return shadowed
 }
 
 // externShadowedHit 判断 name 自身或其父域是否为被遮蔽的 gfw 域名
 func externShadowedHit(name string) bool {
+	shadowed := currentDomains().shadowed
 	cur := normalizeName(name)
 	for cur != "" {
-		if _, ok := externShadowed[cur]; ok {
+		if _, ok := shadowed[cur]; ok {
 			return true
 		}
 		parent, ok := parentDomain(cur)
@@ -164,12 +188,13 @@ func classifyName(name string) int {
 	if name == "" {
 		return routeAuto
 	}
+	d := currentDomains()
 	cur := name
 	for {
-		if _, ok := gfwDomains[cur]; ok {
+		if _, ok := d.gfw[cur]; ok {
 			return routeExtern
 		}
-		if _, ok := chinaDomains[cur]; ok {
+		if _, ok := d.china[cur]; ok {
 			return routeLocal
 		}
 		parent, ok := parentDomain(cur)
