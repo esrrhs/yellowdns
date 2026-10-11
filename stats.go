@@ -71,6 +71,9 @@ var staleStats func() int
 // 未注入时按禁用输出。丢弃条数非 0 表示磁盘跟不上查询速率。
 var queryLogStatus func() (enabled bool, written, dropped int64)
 
+// dotStatus 由 main 注入，返回 DoT 监听器是否启用；未注入按禁用输出。
+var dotStatus func() bool
+
 // ecsModeLabel 保存当前 ECS 策略的文本标签（off / cidr:x.x.x.x/xx / strip），
 // 启动时写入一次；进程内不变。
 var ecsModeLabel = func() *atomic.Value {
@@ -485,6 +488,9 @@ type statsSnapshot struct {
 		Mode    string `json:"mode"`    // off / cidr:<cidr> / strip
 		Applied int64  `json:"applied"` // 被策略改写的 A/AAAA 查询累计数
 	} `json:"ecs"`
+	DOT struct {
+		Enabled bool `json:"enabled"` // 是否启用 DNS-over-TLS 入站监听（-tls）
+	} `json:"dot"`
 	Updates struct {
 		Enabled         bool                            `json:"enabled"`
 		IntervalSeconds int64                           `json:"interval_seconds"`
@@ -557,6 +563,9 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	}
 	snap.ECS.Mode, _ = ecsModeLabel.Load().(string)
 	snap.ECS.Applied = s.ecsApplied.Load()
+	if dotStatus != nil {
+		snap.DOT.Enabled = dotStatus()
+	}
 	chinaH, gfwH, geoH := updateMetrics.snapshot()
 	snap.Updates.Sources = map[string]updateSourceSnapshot{
 		"china": chinaH,
@@ -697,6 +706,13 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_ecs_info{mode=%q} 1\n", snap.ECS.Mode)
 	writeHelp("yellowdns_ecs_applied_total", "counter", "A/AAAA queries whose EDNS Client Subnet option was added, overridden or stripped before forwarding.")
 	fmt.Fprintf(&b, "yellowdns_ecs_applied_total %d\n", snap.ECS.Applied)
+
+	writeHelp("yellowdns_dot_info", "gauge", "Always 1 when the DNS-over-TLS (RFC 7858) inbound listener is enabled, 0 otherwise.")
+	dotVal := 0
+	if snap.DOT.Enabled {
+		dotVal = 1
+	}
+	fmt.Fprintf(&b, "yellowdns_dot_info %d\n", dotVal)
 
 	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
 	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")

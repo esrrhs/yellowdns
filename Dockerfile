@@ -20,5 +20,6 @@ COPY GeoLite2-Country.mmdb ./GeoLite2-Country.mmdb
 # -update 的默认落盘目录是工作目录 /app，需要对非 root 用户可写。
 RUN chown -R app:app /app
 USER app
-EXPOSE 53/udp 53/tcp
+# 853/tcp 仅在启用 -tls 时监听；EXPOSE 仅作文档声明，不改变运行行为。
+EXPOSE 53/udp 53/tcp 853/tcp
 CMD ["./yellowdns"]

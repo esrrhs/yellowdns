@@ -388,6 +388,9 @@ func main() {
 	defer common.CrashLog()
 
 	listen := flag.String("l", ":53", "listen addr (udp and tcp)")
+	tlsListen := flag.String("tls", "", "DNS-over-TLS (RFC 7858) listen addr (e.g. :853 or 127.0.0.1:853); empty disables. Reuses the same resolver as -l")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (PEM) for -tls; required when -tls is set")
+	tlsKey := flag.String("tls-key", "", "TLS private key file (PEM, unencrypted) for -tls; required when -tls is set. Reloaded together with rules on SIGHUP for cert renewal")
 	localserer := flag.String("los", "114.114.114.114:53", "local dns servers, comma-separated; host:port=UDP, tcp://host:port=TCP, https://host/dns-query=DoH")
 	externalserver := flag.String("exs", defaultExternalUpstreams, "external dns servers, comma-separated; same formats as -los")
 	localregion := flag.String("lor", "CN", "local region")
@@ -459,6 +462,10 @@ func main() {
 	}
 	ecsPolicy, err := parseECSPolicy(*ecsCIDR, *ecsStrip)
 	if err != nil {
+		loggo.Error("%v", err)
+		return
+	}
+	if err := validateTLSConfig(*tlsListen, *tlsCert, *tlsKey); err != nil {
 		loggo.Error("%v", err)
 		return
 	}
@@ -619,6 +626,20 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
+	// 可选的 DoT 监听器：明文监听已 bind 成功后再启动 TLS，失败则把明文
+	// 监听一并停掉后退出，避免"只有一半入站"的实例进入就绪。
+	var dot *dotServer
+	if *tlsListen != "" {
+		dot, err = newDoTServer(*tlsListen, *tlsCert, *tlsKey, rr)
+		if err != nil {
+			loggo.Error("dns-over-tls server start fail %v", err)
+			_ = srv.Stop()
+			return
+		}
+		dotStatus = func() bool { return true }
+		loggo.Info("listening on %s (dns-over-tls)", *tlsListen)
+	}
+
 	// currentGeoFile 在每次重载时重新选择：自动更新落盘新库后，HUP/更新触发的
 	// 重载都应立即切到远端库；远端库被移除时回退 -lof 内置库。
 	currentGeoFile := func() string {
@@ -676,11 +697,20 @@ func main() {
 			cn, gfw, hostsN, e := reloadAll()
 			if e != nil {
 				loggo.Error("reload fail, keep old rules: %v", e)
-				return
+			} else {
+				// 规则重载成功才重新打开查询日志，避免把半次重载写进日志。
+				qlog.reopen()
+				loggo.Info("reload ok china %d gfw %d hosts %d shadowed %d", cn, gfw, hostsN, len(currentDomains().shadowed))
 			}
-			// 规则重载后重新打开查询日志，兼容外部 logrotate 的 rename+reopen 模式。
-			qlog.reopen()
-			loggo.Info("reload ok china %d gfw %d hosts %d shadowed %d", cn, gfw, hostsN, len(currentDomains().shadowed))
+			// 证书重载与规则相互独立：即使规则重载失败也要处理续期；
+			// 坏证书保留旧证书继续服务。
+			if dot != nil {
+				if err := dot.reloadCert(); err != nil {
+					loggo.Warn("tls cert reload fail: %v", err)
+				} else {
+					loggo.Info("tls cert reloaded")
+				}
+			}
 		},
 		func() {
 			loggo.Info("stopping...")
@@ -692,6 +722,7 @@ func main() {
 				time.Sleep(*shutdownDelay)
 			}
 			_ = srv.Stop()
+			_ = dot.stop()
 			// 监听器停止后不会再有新查询，排空查询日志队列再退出。
 			qlog.close(2 * time.Second)
 			if stats != nil {
