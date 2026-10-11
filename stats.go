@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -45,6 +46,9 @@ var metrics = &statsCounters{}
 
 // cacheStatus 由 main 注入，返回 resolver 当前响应缓存条目数；未注入时按 0 输出。
 var cacheStatus func() int
+
+// updateStatusInfo 由 main 注入，返回自动更新是否启用与检查间隔；未注入时按禁用输出。
+var updateStatusInfo func() (enabled bool, interval time.Duration)
 
 func (s *statsCounters) reset() {
 	*s = statsCounters{}
@@ -110,6 +114,11 @@ type statsSnapshot struct {
 		AAAA  int64 `json:"AAAA"`
 		Other int64 `json:"other"`
 	} `json:"qtypes"`
+	Updates struct {
+		Enabled         bool                            `json:"enabled"`
+		IntervalSeconds int64                           `json:"interval_seconds"`
+		Sources         map[string]updateSourceSnapshot `json:"sources"`
+	} `json:"updates"`
 }
 
 func (s *statsCounters) snapshot() statsSnapshot {
@@ -138,6 +147,18 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Qtypes.A = s.qtypeA.Load()
 	snap.Qtypes.AAAA = s.qtypeAAAA.Load()
 	snap.Qtypes.Other = s.qtypeOther.Load()
+
+	if updateStatusInfo != nil {
+		enabled, interval := updateStatusInfo()
+		snap.Updates.Enabled = enabled
+		snap.Updates.IntervalSeconds = int64(interval.Seconds())
+	}
+	chinaH, gfwH, geoH := updateMetrics.snapshot()
+	snap.Updates.Sources = map[string]updateSourceSnapshot{
+		"china": chinaH,
+		"gfw":   gfwH,
+		"geoip": geoH,
+	}
 	return snap
 }
 
@@ -197,6 +218,20 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_cache_entries %d\n", snap.Cache.Entries)
 	writeHelp("yellowdns_cache_flushes_total", "counter", "Explicit cache flushes triggered via POST /cache/flush.")
 	fmt.Fprintf(&b, "yellowdns_cache_flushes_total %d\n", snap.Cache.Flushes)
+
+	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
+	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")
+	writeHelp("yellowdns_update_success_total", "counter", "Successful auto-update source checks.")
+	writeHelp("yellowdns_update_failures_total", "counter", "Failed auto-update source checks (download, size, health validation or disk).")
+	writeHelp("yellowdns_update_consecutive_failures", "gauge", "Consecutive failed checks per source; reset to 0 on success.")
+	for _, src := range []string{"china", "gfw", "geoip"} {
+		h := snap.Updates.Sources[src]
+		fmt.Fprintf(&b, "yellowdns_update_last_attempt_timestamp_seconds{source=%q} %d\n", src, h.LastAttempt)
+		fmt.Fprintf(&b, "yellowdns_update_last_success_timestamp_seconds{source=%q} %d\n", src, h.LastSuccess)
+		fmt.Fprintf(&b, "yellowdns_update_success_total{source=%q} %d\n", src, h.Successes)
+		fmt.Fprintf(&b, "yellowdns_update_failures_total{source=%q} %d\n", src, h.Failures)
+		fmt.Fprintf(&b, "yellowdns_update_consecutive_failures{source=%q} %d\n", src, h.ConsecutiveFailures)
+	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	if _, err := w.Write([]byte(b.String())); err != nil {
@@ -273,6 +308,49 @@ func (s *statsServer) cacheFlushHandler(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+// updateRefreshHandler 立即触发一次 china/gfw/GeoIP 全量刷新（与周期检查串行，
+// 不会并发重载）。鉴权同 /stats，只接受 POST；返回各源结果。部分源失败仍返回
+// 200（旧规则继续生效，细节在 body）；三个源全部失败返回 502；刷新超时返回 504。
+func (s *statsServer) updateRefreshHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="yellowdns-stats"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.triggerUpdate == nil {
+		http.Error(w, "auto-update disabled", http.StatusServiceUnavailable)
+		return
+	}
+	// 三个源串行下载，最坏情况接近各自 60s 超时之和，给到 150s。
+	ctx, cancel := context.WithTimeout(r.Context(), 150*time.Second)
+	defer cancel()
+	res, err := s.triggerUpdate(ctx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			http.Error(w, "refresh timed out", http.StatusGatewayTimeout)
+			return
+		}
+		http.Error(w, "refresh not available", http.StatusServiceUnavailable)
+		return
+	}
+	code := http.StatusOK
+	if res.China.Error != "" && res.Gfw.Error != "" && res.GeoIP.Error != "" {
+		code = http.StatusBadGateway
+	}
+	loggo.Info("manual update refresh: china{changed=%v err=%q} gfw{changed=%v err=%q} geoip{changed=%v err=%q} reloaded=%v",
+		res.China.Changed, res.China.Error, res.Gfw.Changed, res.Gfw.Error,
+		res.GeoIP.Changed, res.GeoIP.Error, res.Reloaded)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		loggo.Warn("write refresh result fail: %v", err)
+	}
+}
+
 // authorized 校验 Bearer token；未配置 token 时不做限制（默认仅建议绑回环）。
 // 比较走常量时间，避免计时侧信道。
 func (s *statsServer) authorized(r *http.Request) bool {
@@ -289,9 +367,11 @@ func (s *statsServer) authorized(r *http.Request) bool {
 
 // statsServer 是可选的统计 HTTP 服务，-stats 指定监听地址时启用。
 type statsServer struct {
-	srv        *http.Server
-	token      string
-	flushCache func() int // resolver 就绪后由 main 注入
+	srv   *http.Server
+	token string
+	// flushCache / triggerUpdate 在 resolver/updater 就绪后由 main 注入。
+	flushCache    func() int
+	triggerUpdate func(ctx context.Context) (updateResult, error)
 }
 
 func startStatsServer(addr, token string) *statsServer {
@@ -307,6 +387,7 @@ func startStatsServer(addr, token string) *statsServer {
 	mux.HandleFunc("/stats", s.statsHandler)
 	mux.HandleFunc("/metrics", s.metricsHandler)
 	mux.HandleFunc("/cache/flush", s.cacheFlushHandler)
+	mux.HandleFunc("/update/refresh", s.updateRefreshHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/healthz", healthzHandler)
 	go func() {
