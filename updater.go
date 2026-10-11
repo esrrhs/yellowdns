@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/esrrhs/gohome/loggo"
@@ -66,7 +67,91 @@ type updater struct {
 	client *http.Client
 	// now 可在测试中注入，决定默认 GeoIP 库的月份。
 	now func() time.Time
+	// trigger 由 POST /update/refresh 投递刷新请求，run 循环在同一 goroutine
+	// 串行消费，保证周期检查与手动刷新不会并发执行 runOnce。
+	trigger chan updateRequest
 }
+
+// updateRequest 是手动刷新请求；run 循环执行完一次 runOnce 后把结果投回 reply。
+type updateRequest struct {
+	reply chan updateResult
+}
+
+// sourceResult 是单个数据源本次检查的结果。
+type sourceResult struct {
+	Changed bool   `json:"changed"`         // 是否有新内容落盘
+	Error   string `json:"error,omitempty"` // 失败原因；空表示源可达且检查通过（含内容未变）
+}
+
+// updateResult 是一次完整刷新周期（china/gfw/geoip + 是否触发重载）的结果。
+type updateResult struct {
+	China    sourceResult `json:"china"`
+	Gfw      sourceResult `json:"gfw"`
+	GeoIP    sourceResult `json:"geoip"`
+	Reloaded bool         `json:"reloaded"` // 是否因内容变化执行了热重载
+}
+
+// errUpdateDisabled 表示未开启 -update，手动刷新不可用。
+var errUpdateDisabled = errors.New("auto-update is disabled (set -update to enable)")
+
+// updateSourceHealth 用原子计数跟踪单个数据源（china/gfw/geoip）的更新健康，
+// 供 /stats 与 Prometheus 暴露；快照读取路径完全无锁。
+type updateSourceHealth struct {
+	lastAttempt atomic.Int64 // unix 秒，最近一次尝试时间
+	lastSuccess atomic.Int64 // unix 秒，最近一次源可达（含内容未变）；0 表示从未成功
+	successes   atomic.Int64
+	failures    atomic.Int64
+	consecutive atomic.Int64 // 连续失败次数，任意一次成功即清零
+}
+
+// record 记录一次源检查结果。ok 为 true 表示源可达（无论内容是否变化）。
+func (h *updateSourceHealth) record(ok bool) {
+	now := time.Now().Unix()
+	h.lastAttempt.Store(now)
+	if ok {
+		h.lastSuccess.Store(now)
+		h.successes.Add(1)
+		h.consecutive.Store(0)
+	} else {
+		h.failures.Add(1)
+		h.consecutive.Add(1)
+	}
+}
+
+// updateSourceSnapshot 是单个数据源的健康快照。
+type updateSourceSnapshot struct {
+	LastSuccess         int64 `json:"last_success_unixtime"` // 0 表示从未成功
+	LastAttempt         int64 `json:"last_attempt_unixtime"` // 0 表示从未尝试
+	Successes           int64 `json:"successes"`
+	Failures            int64 `json:"failures"`
+	ConsecutiveFailures int64 `json:"consecutive_failures"`
+}
+
+// updateHealth 汇总三个数据源的健康状态。
+type updateHealth struct {
+	china updateSourceHealth
+	gfw   updateSourceHealth
+	geoip updateSourceHealth
+}
+
+func (h *updateHealth) snapshot() (china, gfw, geoip updateSourceSnapshot) {
+	snap := func(x *updateSourceHealth) updateSourceSnapshot {
+		return updateSourceSnapshot{
+			LastSuccess:         x.lastSuccess.Load(),
+			LastAttempt:         x.lastAttempt.Load(),
+			Successes:           x.successes.Load(),
+			Failures:            x.failures.Load(),
+			ConsecutiveFailures: x.consecutive.Load(),
+		}
+	}
+	return snap(&h.china), snap(&h.gfw), snap(&h.geoip)
+}
+
+// updateMetrics 是全局更新健康指标；-update 未开启时保持零值。
+var updateMetrics = &updateHealth{}
+
+// reset 清空全部源的健康记录，供测试隔离全局状态。
+func (h *updateHealth) reset() { *h = updateHealth{} }
 
 func (u *updater) chinaPath() string { return filepath.Join(u.dir, remoteChinaFile) }
 func (u *updater) gfwPath() string   { return filepath.Join(u.dir, remoteGfwFile) }
@@ -95,38 +180,79 @@ func (u *updater) httpClient() *http.Client {
 	return &http.Client{Timeout: 90 * time.Second}
 }
 
-// run 启动即检查一次，之后按 interval 周期检查，直到进程退出。
+// run 启动即检查一次，之后按 interval 周期检查，并串行消费手动刷新请求，直到进程退出。
 func (u *updater) run() {
 	u.runOnce()
 	t := time.NewTicker(u.interval)
 	defer t.Stop()
-	for range t.C {
-		u.runOnce()
+	for {
+		select {
+		case <-t.C:
+			u.runOnce()
+		case req := <-u.trigger:
+			req.reply <- u.runOnce()
+		}
 	}
 }
 
-func (u *updater) runOnce() {
+// requestRun 通过 trigger 通道请求一次立即刷新，阻塞到 run 循环执行完毕或 ctx 超时。
+// 未开启自动更新（没有 run 循环）时返回 errUpdateDisabled。
+func (u *updater) requestRun(ctx context.Context) (updateResult, error) {
+	if u.trigger == nil {
+		return updateResult{}, errUpdateDisabled
+	}
+	reply := make(chan updateResult, 1)
+	select {
+	case u.trigger <- updateRequest{reply: reply}:
+	case <-ctx.Done():
+		return updateResult{}, ctx.Err()
+	}
+	select {
+	case res := <-reply:
+		return res, nil
+	case <-ctx.Done():
+		return updateResult{}, ctx.Err()
+	}
+}
+
+func (u *updater) runOnce() updateResult {
+	var res updateResult
+
 	chinaChanged, chinaErr := u.updateOne("china", u.chinaURL, u.chinaPath(), minChinaDomains)
 	if chinaErr != nil {
 		loggo.Warn("update china list fail: %v", chinaErr)
+		res.China.Error = chinaErr.Error()
 	}
+	updateMetrics.china.record(chinaErr == nil)
+	res.China.Changed = chinaChanged
+
 	gfwChanged, gfwErr := u.updateOne("gfw", u.gfwURL, u.gfwPath(), minGfwDomains)
 	if gfwErr != nil {
 		loggo.Warn("update gfw list fail: %v", gfwErr)
+		res.Gfw.Error = gfwErr.Error()
 	}
+	updateMetrics.gfw.record(gfwErr == nil)
+	res.Gfw.Changed = gfwChanged
+
 	geoChanged, geoErr := u.updateGeo()
 	if geoErr != nil {
 		loggo.Warn("update geoip database fail: %v", geoErr)
+		res.GeoIP.Error = geoErr.Error()
 	}
+	updateMetrics.geoip.record(geoErr == nil)
+	res.GeoIP.Changed = geoChanged
+
 	if !chinaChanged && !gfwChanged && !geoChanged && chinaErr == nil && gfwErr == nil && geoErr == nil {
 		loggo.Info("remote lists unchanged")
-		return
+		return res
 	}
 	if chinaErr != nil || gfwErr != nil || geoErr != nil {
 		// 任一失败仍按现有远端文件（旧内容或新内容）重载，保持与磁盘一致。
 		loggo.Info("partial update, reloading with available remote files")
 	}
 	u.applyRemote()
+	res.Reloaded = true
+	return res
 }
 
 // applyRemote 按当前存在的远端文件（优先）+ 用户附加文件触发重载。

@@ -44,12 +44,13 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 * `-update-dir`: directory for the downloaded remote lists (`china.remote.txt`, `gfw.remote.txt`) and GeoIP database (`geoip.country.mmdb`), default `.`. Files already present there are loaded at startup even without `-update`
 * `-shutdown-delay`: when set (e.g. `-shutdown-delay 2s`), SIGINT/SIGTERM flips `/readyz` to 503, keeps serving DNS for the delay so load balancers can drain the instance, then closes listeners; default `0` closes immediately
 * `-stats`: HTTP listen address serving operational endpoints (e.g. `-stats 127.0.0.1:8053`); empty disables:
-  * `GET /stats` — JSON counters (queries by route, shadowed bypasses, fallbacks, hosts hits, upstream attempts/errors, response-cache entries and flush count, qtypes, list sizes, version, uptime)
+  * `GET /stats` — JSON counters (queries by route, shadowed bypasses, fallbacks, hosts hits, upstream attempts/errors, response-cache entries and flush count, auto-update health per source with last-success timestamp and consecutive failures, qtypes, list sizes, version, uptime)
   * `GET /metrics` — the same counters in Prometheus text exposition format
   * `POST /cache/flush` — clear the resolver response cache, returns `{"cleared_entries": N}`; POST-only, same bearer auth as `/stats`
+  * `POST /update/refresh` — trigger an immediate china/gfw/GeoIP refresh (serialized with the periodic check, hot-reloads on change) and return per-source results; POST-only, same bearer auth. `200` when at least one source is reachable (partial failures stay in the body), `502` when all three fail, `503` when `-update` is disabled
   * `GET /readyz` — unauthenticated readiness probe: `503 not ready` until the UDP+TCP listeners are up, `200 ready` afterwards (flips back to 503 during graceful shutdown). Intended for K8s readinessProbe / load-balancer drain; it exposes no data
   * `GET /healthz` — unauthenticated liveness probe returning `200 ok` (intended for Docker/K8s health checks; it exposes no data)
-* `-stats-token`: bearer token required to access `/stats`, `/metrics` and `POST /cache/flush`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show up in `ps`). `/healthz` and `/readyz` stay unauthenticated. When unset the endpoints are open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
+* `-stats-token`: bearer token required to access `/stats`, `/metrics`, `POST /cache/flush` and `POST /update/refresh`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show up in `ps`). `/healthz` and `/readyz` stay unauthenticated. When unset the endpoints are open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
 * `-version`: show version and exit
 * other options: `./yellowdns -h`
 
@@ -59,7 +60,7 @@ Features & Routing:
 * **Hot Reload (Unix)**: `kill -HUP <pid>` reloads the domain lists and the GeoIP database without dropping the listener; failed reloads keep the previous rules. SIGINT/SIGTERM shut the server down gracefully.
 * **Optional Auto-Update**: `-update 24h` keeps the embedded domestic/interfered lists fresh directly from dnsmasq-china-list and v2ray-rules-dat, and the GeoIP country database fresh from [DB-IP](https://dbip.com/)'s free monthly `DBIP-Country-Lite` (current month, falling back to the previous one). Downloads are size-limited and health-checked (minimum domain count; the mmdb is gunzipped and opened to verify it is a real MaxMind country database), saved atomically, and skipped when the content hash is unchanged; any failure keeps the previously active rules and database. A downloaded database takes precedence over the `-lof` file and is hot-reloaded.
 * **Static Hosts**: `-hosts rules.txt` forces names to fixed addresses using standard hosts or dnsmasq `address=/` syntax (with wildcard subdomains, IPv4 and IPv6). Static answers take precedence over all routing and upstreams and are hot-reloaded on SIGHUP.
-* **Operational Endpoints**: `-stats 127.0.0.1:8053` serves JSON counters at `/stats` (including live response-cache size), Prometheus metrics at `/metrics`, a token-protected `POST /cache/flush` to clear the response cache on demand, an unauthenticated `/healthz` liveness probe, and a `/readyz` readiness probe that gates on listener startup and graceful shutdown.
+* **Operational Endpoints**: `-stats 127.0.0.1:8053` serves JSON counters at `/stats` (including live response-cache size and per-source auto-update health: last attempt/success time, success/failure counts, consecutive failures), Prometheus metrics at `/metrics`, token-protected `POST /cache/flush` (clear the response cache) and `POST /update/refresh` (pull lists/GeoIP immediately instead of waiting for the interval), an unauthenticated `/healthz` liveness probe, and a `/readyz` readiness probe that gates on listener startup and graceful shutdown.
 * **Encrypted External Queries by Default**: `-exs` defaults to DNS-over-HTTPS, so interference cannot poison the external lookup itself. `-los`/`-exs` accept comma-separated lists of UDP, TCP and DoH addresses with in-order failover.
 * **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries, response caching and GeoIP anti-poisoning validation. The embedded domestic/interfered lists are loaded straight into the resolver.
 * **Routing Priority**:
@@ -75,6 +76,7 @@ Example with token auth via environment variable:
 YELLOWDNS_STATS_TOKEN=s3cret ./yellowdns -stats 127.0.0.1:8053
 curl -H "Authorization: Bearer s3cret" http://127.0.0.1:8053/stats
 curl -X POST -H "Authorization: Bearer s3cret" http://127.0.0.1:8053/cache/flush
+curl -X POST -H "Authorization: Bearer s3cret" http://127.0.0.1:8053/update/refresh
 ```
 
 # Data

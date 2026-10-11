@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,6 +41,8 @@ func TestCountDomains(t *testing.T) {
 // 坏内容（低于健康下限）与下载失败均保留旧规则。
 func TestUpdaterRunOnce(t *testing.T) {
 	t.Cleanup(func() { _, _, _ = loadDomainLists(nil, nil) })
+	updateMetrics.reset()
+	t.Cleanup(updateMetrics.reset)
 
 	var chinaBody, gfwBody []byte
 	chinaStatus := http.StatusOK
@@ -159,6 +163,42 @@ func TestUpdaterRunOnce(t *testing.T) {
 	}
 	if got := classifyName("d0.update-gfw.test."); got != routeExtern {
 		t.Errorf("old gfw rule lost after failed update, got %s", routeName(got))
+	}
+
+	// 健康指标：china/gfw 各成功 2 次（首次+unchanged）、失败 2 次（坏内容+500），
+	// 末尾连续失败为 2；geoip 四次全部成功。
+	chinaH, gfwH, geoH := updateMetrics.snapshot()
+	if chinaH.Successes != 2 || chinaH.Failures != 2 || chinaH.ConsecutiveFailures != 2 || chinaH.LastSuccess == 0 || chinaH.LastAttempt == 0 {
+		t.Errorf("china health = %+v", chinaH)
+	}
+	if gfwH.Successes != 2 || gfwH.Failures != 2 || gfwH.ConsecutiveFailures != 2 {
+		t.Errorf("gfw health = %+v", gfwH)
+	}
+	if geoH.Successes != 4 || geoH.Failures != 0 || geoH.ConsecutiveFailures != 0 {
+		t.Errorf("geoip health = %+v", geoH)
+	}
+}
+
+// TestUpdateSourceHealthRecord 直接验证单源健康计数的累加与连续失败清零。
+func TestUpdateSourceHealthRecord(t *testing.T) {
+	var hs updateHealth
+	before := time.Now().Unix()
+	hs.china.record(true)
+	hs.china.record(true)
+	s, _, _ := hs.snapshot()
+	if s.Successes != 2 || s.Failures != 0 || s.ConsecutiveFailures != 0 || s.LastSuccess < before {
+		t.Fatalf("after two successes: %+v", s)
+	}
+	hs.china.record(false)
+	hs.china.record(false)
+	s, _, _ = hs.snapshot()
+	if s.Successes != 2 || s.Failures != 2 || s.ConsecutiveFailures != 2 {
+		t.Fatalf("after two failures: %+v", s)
+	}
+	hs.china.record(true)
+	s, _, _ = hs.snapshot()
+	if s.Failures != 2 || s.ConsecutiveFailures != 0 || s.Successes != 3 {
+		t.Fatalf("consecutive failures must reset on success: %+v", s)
 	}
 }
 
@@ -320,4 +360,105 @@ func TestUpdateGeo(t *testing.T) {
 			t.Fatal("all sources failing must return error")
 		}
 	})
+}
+
+// TestRequestRun 验证手动刷新通道：未启用时报错；run 循环串行消费触发请求，
+// 多个并发请求都能拿到各自结果且不丢请求。
+func TestRequestRun(t *testing.T) {
+	t.Cleanup(func() { _, _, _ = loadDomainLists(nil, nil) })
+	updateMetrics.reset()
+	t.Cleanup(updateMetrics.reset)
+
+	// 未开启自动更新（trigger 为 nil）：明确报错而不是挂住
+	idle := &updater{}
+	if _, err := idle.requestRun(context.Background()); err != errUpdateDisabled {
+		t.Fatalf("disabled requestRun err = %v, want errUpdateDisabled", err)
+	}
+
+	mmdbBytes, err := os.ReadFile("GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/china", func(w http.ResponseWriter, r *http.Request) { w.Write(genUpdateChina(minChinaDomains)) })
+	mux.HandleFunc("/gfw", func(w http.ResponseWriter, r *http.Request) { w.Write(genUpdateGfw(minGfwDomains)) })
+	mux.HandleFunc("/geo", func(w http.ResponseWriter, r *http.Request) { w.Write(gzipBytes(t, mmdbBytes)) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	dir := t.TempDir()
+	apply := func(chinaFiles, gfwFiles []string, geoFile string) (int, int, int, error) {
+		cn, gfwN, e := loadDomainLists(chinaFiles, gfwFiles)
+		return cn, gfwN, 0, e
+	}
+	u := &updater{
+		chinaURL:     srv.URL + "/china",
+		gfwURL:       srv.URL + "/gfw",
+		geoURLs:      []string{srv.URL + "/geo"},
+		dir:          dir,
+		interval:     time.Hour,
+		apply:        apply,
+		localGeoFile: "builtin.mmdb",
+		client:       srv.Client(),
+		trigger:      make(chan updateRequest, 1),
+	}
+	go u.run()
+
+	// 等启动后的首次周期检查完成（geoip 文件落盘）
+	geoDst := filepath.Join(dir, remoteGeoFile)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(geoDst); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(geoDst); err != nil {
+		t.Fatal("initial run loop did not download the geoip database")
+	}
+
+	// 第二次触发：内容未变，三源无错误、不重载
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := u.requestRun(ctx)
+	if err != nil {
+		t.Fatalf("requestRun: %v", err)
+	}
+	if res.China.Error != "" || res.Gfw.Error != "" || res.GeoIP.Error != "" || res.Reloaded {
+		t.Fatalf("unchanged refresh = %+v, want no errors and no reload", res)
+	}
+
+	// 三个并发请求必须全部被串行处理并返回，不丢、不卡死
+	var wg sync.WaitGroup
+	results := make([]updateResult, 3)
+	errs := make([]error, 3)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = u.requestRun(ctx)
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("concurrent requestRun %d: %v", i, e)
+		}
+		if results[i].China.Error != "" || results[i].GeoIP.Error != "" {
+			t.Fatalf("concurrent result %d = %+v", i, results[i])
+		}
+	}
+}
+
+// TestRequestRunContextCancel 验证等待排队期间 ctx 取消会立即返回，不会挂死。
+func TestRequestRunContextCancel(t *testing.T) {
+	u := &updater{trigger: make(chan updateRequest, 1)}
+	// 没人消费 trigger；缓冲放入一个请求占满通道，第二个请求应在发送等待时响应取消
+	queued := updateRequest{reply: make(chan updateResult, 1)}
+	u.trigger <- queued
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := u.requestRun(ctx); err != context.Canceled {
+		t.Fatalf("canceled requestRun err = %v, want context.Canceled", err)
+	}
 }

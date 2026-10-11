@@ -404,16 +404,24 @@ func main() {
 		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, gf)
 	}
 
+	u := &updater{
+		chinaURL:     defaultChinaListURL,
+		gfwURL:       defaultGFWListURL,
+		dir:          *updateDir,
+		interval:     *updateEvery,
+		apply:        apply,
+		localGeoFile: *localregionfile,
+		extraChina:   userChinaFiles,
+		extraGfw:     userGfwFiles,
+	}
+	updateStatusInfo = func() (bool, time.Duration) {
+		return *updateEvery > 0, *updateEvery
+	}
 	if *updateEvery > 0 {
-		u := &updater{
-			chinaURL:     defaultChinaListURL,
-			gfwURL:       defaultGFWListURL,
-			dir:          *updateDir,
-			interval:     *updateEvery,
-			apply:        apply,
-			localGeoFile: *localregionfile,
-			extraChina:   userChinaFiles,
-			extraGfw:     userGfwFiles,
+		// 带缓冲的 trigger：HTTP 请求在 run 循环忙时等待执行，不丢请求。
+		u.trigger = make(chan updateRequest, 1)
+		if stats != nil {
+			stats.triggerUpdate = u.requestRun
 		}
 		go u.run()
 		loggo.Info("auto update enabled, interval %v, dir %s", *updateEvery, *updateDir)

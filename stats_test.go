@@ -443,3 +443,130 @@ func TestStatsRoutingCounters(t *testing.T) {
 		t.Errorf("upstreams = %+v, want attempts 4 errors 1", snap.Upstreams)
 	}
 }
+
+func TestUpdateRefreshHandler(t *testing.T) {
+	// 未配置触发回调（-update 关闭）：401 → 405 → 503 的判定顺序
+	open := &statsServer{}
+	rec := httptest.NewRecorder()
+	open.updateRefreshHandler(rec, httptest.NewRequest(http.MethodPost, "/update/refresh", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled POST status = %d, want 503", rec.Code)
+	}
+
+	authed := &statsServer{token: "tk", triggerUpdate: func(ctx context.Context) (updateResult, error) {
+		return updateResult{}, nil
+	}}
+	// 无鉴权 -> 401
+	rec401 := httptest.NewRecorder()
+	authed.updateRefreshHandler(rec401, httptest.NewRequest(http.MethodPost, "/update/refresh", nil))
+	if rec401.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", rec401.Code)
+	}
+	// GET -> 405
+	recGet := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/update/refresh", nil)
+	getReq.Header.Set("Authorization", "Bearer tk")
+	authed.updateRefreshHandler(recGet, getReq)
+	if recGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", recGet.Code)
+	}
+	// 全部成功：200，返回结构化结果
+	ok := &statsServer{token: "tk", triggerUpdate: func(ctx context.Context) (updateResult, error) {
+		return updateResult{
+			China:    sourceResult{Changed: true},
+			Reloaded: true,
+		}, nil
+	}}
+	recOK := httptest.NewRecorder()
+	postReq := httptest.NewRequest(http.MethodPost, "/update/refresh", nil)
+	postReq.Header.Set("Authorization", "Bearer tk")
+	ok.updateRefreshHandler(recOK, postReq)
+	if recOK.Code != http.StatusOK {
+		t.Fatalf("all-ok status = %d, want 200", recOK.Code)
+	}
+	var res updateResult
+	if err := json.Unmarshal(recOK.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if !res.China.Changed || !res.Reloaded {
+		t.Fatalf("body = %+v", res)
+	}
+
+	// 部分源失败仍 200（旧规则继续服务）
+	partial := &statsServer{token: "tk", triggerUpdate: func(ctx context.Context) (updateResult, error) {
+		return updateResult{GeoIP: sourceResult{Error: "http 404"}}, nil
+	}}
+	recPartial := httptest.NewRecorder()
+	partialReq := httptest.NewRequest(http.MethodPost, "/update/refresh", nil)
+	partialReq.Header.Set("Authorization", "Bearer tk")
+	partial.updateRefreshHandler(recPartial, partialReq)
+	if recPartial.Code != http.StatusOK {
+		t.Fatalf("partial failure status = %d, want 200", recPartial.Code)
+	}
+
+	// 三个源全失败：502
+	allFail := &statsServer{token: "tk", triggerUpdate: func(ctx context.Context) (updateResult, error) {
+		return updateResult{
+			China: sourceResult{Error: "x"},
+			Gfw:   sourceResult{Error: "y"},
+			GeoIP: sourceResult{Error: "z"},
+		}, nil
+	}}
+	recFail := httptest.NewRecorder()
+	failReq := httptest.NewRequest(http.MethodPost, "/update/refresh", nil)
+	failReq.Header.Set("Authorization", "Bearer tk")
+	allFail.updateRefreshHandler(recFail, failReq)
+	if recFail.Code != http.StatusBadGateway {
+		t.Fatalf("all-failed status = %d, want 502", recFail.Code)
+	}
+
+	// 触发超时：504
+	timedOut := &statsServer{token: "tk", triggerUpdate: func(ctx context.Context) (updateResult, error) {
+		return updateResult{}, context.DeadlineExceeded
+	}}
+	recTO := httptest.NewRecorder()
+	toReq := httptest.NewRequest(http.MethodPost, "/update/refresh", nil)
+	toReq.Header.Set("Authorization", "Bearer tk")
+	timedOut.updateRefreshHandler(recTO, toReq)
+	if recTO.Code != http.StatusGatewayTimeout {
+		t.Fatalf("timeout status = %d, want 504", recTO.Code)
+	}
+}
+
+func TestUpdateObservability(t *testing.T) {
+	oldInfo := updateStatusInfo
+	updateStatusInfo = func() (bool, time.Duration) { return true, time.Hour }
+	t.Cleanup(func() { updateStatusInfo = oldInfo })
+	updateMetrics.reset()
+	t.Cleanup(updateMetrics.reset)
+	updateMetrics.china.record(true)
+	updateMetrics.gfw.record(false)
+
+	s := &statsServer{}
+	rec := httptest.NewRecorder()
+	s.statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	var snap statsSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Updates.Enabled || snap.Updates.IntervalSeconds != 3600 {
+		t.Fatalf("updates meta = %+v", snap.Updates)
+	}
+	if snap.Updates.Sources["china"].Successes != 1 || snap.Updates.Sources["gfw"].ConsecutiveFailures != 1 {
+		t.Fatalf("sources = %+v", snap.Updates.Sources)
+	}
+
+	recM := httptest.NewRecorder()
+	s.metricsHandler(recM, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recM.Body.String()
+	for _, want := range []string{
+		`yellowdns_update_last_success_timestamp_seconds{source="china"}`,
+		`yellowdns_update_failures_total{source="gfw"} 1`,
+		`yellowdns_update_consecutive_failures{source="gfw"} 1`,
+		`yellowdns_update_success_total{source="china"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q", want)
+		}
+	}
+}
