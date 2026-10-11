@@ -215,6 +215,56 @@ func TestHealthzHandler(t *testing.T) {
 	}
 }
 
+func TestReadyzHandler(t *testing.T) {
+	// 就绪探针不鉴权，即使配置了 token 也要能被 K8s 探针访问。
+	ready.Store(false)
+	t.Cleanup(func() { ready.Store(false) })
+
+	rec := httptest.NewRecorder()
+	readyzHandler(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable || strings.TrimSpace(rec.Body.String()) != "not ready" {
+		t.Fatalf("before ready = %d %q, want 503 not ready", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("content-type = %q", ct)
+	}
+
+	// HEAD 在未就绪时同样返回 503
+	recHead := httptest.NewRecorder()
+	readyzHandler(recHead, httptest.NewRequest(http.MethodHead, "/readyz", nil))
+	if recHead.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HEAD before ready = %d, want 503", recHead.Code)
+	}
+
+	ready.Store(true)
+	rec2 := httptest.NewRecorder()
+	readyzHandler(rec2, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec2.Code != http.StatusOK || strings.TrimSpace(rec2.Body.String()) != "ready" {
+		t.Fatalf("after ready = %d %q, want 200 ready", rec2.Code, rec2.Body.String())
+	}
+
+	// POST 拒绝
+	rec3 := httptest.NewRecorder()
+	readyzHandler(rec3, httptest.NewRequest(http.MethodPost, "/readyz", nil))
+	if rec3.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST readyz = %d, want 405", rec3.Code)
+	}
+
+	// 经真实 HTTP 服务验证：即使配置了 token，探针不带鉴权头也返回 200。
+	mux := http.NewServeMux()
+	mux.HandleFunc("/readyz", readyzHandler)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	httpReq, err := http.Get(ts.URL + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpReq.Body.Close()
+	if httpReq.StatusCode != http.StatusOK {
+		t.Fatalf("http readyz = %d, want 200", httpReq.StatusCode)
+	}
+}
+
 // TestStatsRoutingCounters 走完整 Exchange 路径验证计数器：本地/境外分类、
 // 兜底次数、qtype、上游尝试与失败。
 func TestStatsRoutingCounters(t *testing.T) {

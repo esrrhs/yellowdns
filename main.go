@@ -273,6 +273,22 @@ func main() {
 			return
 		}
 	}
+
+	// 探针服务最先上线：此时规则与 DNS 监听尚未就绪，/readyz 如实返回 503，
+	// 避免启动窗口内的实例被负载均衡提前放入。
+	var stats *statsServer
+	if *statsAddr != "" {
+		// flag 优先，环境变量兜底，避免 token 出现在进程参数中被 ps 看到。
+		token := *statsToken
+		if token == "" {
+			token = os.Getenv("YELLOWDNS_STATS_TOKEN")
+		}
+		if token == "" && !isLoopbackAddr(*statsAddr) {
+			loggo.Warn("stats endpoint on %s has no token and is not loopback-only; set -stats-token or YELLOWDNS_STATS_TOKEN", *statsAddr)
+		}
+		stats = startStatsServer(*statsAddr, token)
+	}
+
 	// 远端列表（若已存在）+ 用户附加文件，二者都合并进内置集合。
 	remoteChinaPath := filepath.Join(*updateDir, remoteChinaFile)
 	remoteGfwPath := filepath.Join(*updateDir, remoteGfwFile)
@@ -345,19 +361,6 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
-	var stats *statsServer
-	if *statsAddr != "" {
-		// flag 优先，环境变量兜底，避免 token 出现在进程参数中被 ps 看到。
-		token := *statsToken
-		if token == "" {
-			token = os.Getenv("YELLOWDNS_STATS_TOKEN")
-		}
-		if token == "" && !isLoopbackAddr(*statsAddr) {
-			loggo.Warn("stats endpoint on %s has no token and is not loopback-only; set -stats-token or YELLOWDNS_STATS_TOKEN", *statsAddr)
-		}
-		stats = startStatsServer(*statsAddr, token)
-	}
-
 	apply := func(chinaFiles, gfwFiles []string) (int, int, int, error) {
 		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, *localregionfile)
 	}
@@ -375,6 +378,9 @@ func main() {
 		go u.run()
 		loggo.Info("auto update enabled, interval %v, dir %s", *updateEvery, *updateDir)
 	}
+
+	// DNS 监听、规则加载、上游与探针服务均已就位，对就绪探针放行。
+	ready.Store(true)
 
 	done := make(chan struct{})
 	// HUP 重载的范围与启动一致：已落盘的远端列表 + 用户附加文件，
@@ -395,6 +401,8 @@ func main() {
 		},
 		func() {
 			loggo.Info("stopping...")
+			// 先摘就绪再关监听，给负载均衡一个剔除实例的窗口。
+			ready.Store(false)
 			if stats != nil {
 				stats.close()
 			}

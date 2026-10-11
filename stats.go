@@ -18,6 +18,12 @@ import (
 // procStart 近似进程启动时间，用于 /stats 的 uptime。
 var procStart = time.Now()
 
+// ready 表示服务是否完成启动、可对外应答；供 /readyz 就绪探针使用。
+// 启动过程中为 false，DNS 服务监听成功后置 true；进程退出时随进程失效。
+var ready = atomic.Bool{}
+
+func isReady() bool { return ready.Load() }
+
 // statsCounters 是全进程查询统计，全部用原子计数，查询路径无锁累加。
 type statsCounters struct {
 	total       atomic.Int64 // 收到的查询总数
@@ -181,6 +187,22 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// readyzHandler 是就绪探针：服务启动完成前返回 503，启动后 200。
+// 不鉴权（K8s readinessProbe 不便带认证头），且不泄露数据。
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if !isReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("not ready\n"))
+		return
+	}
+	_, _ = w.Write([]byte("ready\n"))
+}
+
 // healthzHandler 是无鉴权存活探针（只暴露存活状态，不泄露任何规则/统计信息）。
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -242,6 +264,7 @@ func startStatsServer(addr, token string) *statsServer {
 	}
 	mux.HandleFunc("/stats", s.statsHandler)
 	mux.HandleFunc("/metrics", s.metricsHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/healthz", healthzHandler)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
