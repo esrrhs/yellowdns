@@ -10,7 +10,7 @@ import (
 )
 
 func TestClassifyEmbedded(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	cases := []struct {
@@ -50,13 +50,13 @@ func TestClassifySpecificChinaWins(t *testing.T) {
 	if got := classifyName("www.google.com."); got != routeExtern {
 		t.Fatalf("parent gfw domain got %s", routeName(got))
 	}
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestReloadPicksUpExtraFile(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	name := "reload-test-domain.example"
@@ -75,7 +75,7 @@ func TestReloadPicksUpExtraFile(t *testing.T) {
 	f.Close()
 
 	r := &routingResolver{} // inner 为 nil：只验证规则快照热替换
-	cn, _, err := r.reload(f.Name(), "", "GeoLite2-Country.mmdb")
+	cn, _, err := r.reload([]string{f.Name()}, nil, "GeoLite2-Country.mmdb")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,20 +88,20 @@ func TestReloadPicksUpExtraFile(t *testing.T) {
 
 	// 坏文件不能破坏现有快照
 	before := currentDomains()
-	if _, _, err := r.reload("/no/such/file", "", ""); err == nil {
+	if _, _, err := r.reload([]string{"/no/such/file"}, nil, ""); err == nil {
 		t.Fatal("missing file should fail reload")
 	}
 	if currentDomains() != before {
 		t.Fatal("failed reload must keep the previous snapshot")
 	}
 
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestExternShadowed(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// tiktokcdn.com 同时出现在 gfw 列表与 gohome 内置主干域名中
@@ -131,13 +131,13 @@ func TestExternShadowed(t *testing.T) {
 }
 
 func TestLoadDomainListsMissingFile(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := loadDomainLists("/no/such/china/file", ""); err == nil {
+	if _, _, err := loadDomainLists([]string{"/no/such/china/file"}, nil); err == nil {
 		t.Fatal("missing china file should return error")
 	}
-	if _, _, err := loadDomainLists("", "/no/such/gfw/file"); err == nil {
+	if _, _, err := loadDomainLists(nil, []string{"/no/such/gfw/file"}); err == nil {
 		t.Fatal("missing gfw file should return error")
 	}
 }

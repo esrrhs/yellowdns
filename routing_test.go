@@ -58,7 +58,7 @@ func queryA(t *testing.T, r *routingResolver, name string) string {
 // TestRoutingResolverClassifyFallback 使用 nil inner（gohome 初始化失败的形态），
 // 验证分类结果决定查询走境内还是境外假上游。
 func TestRoutingResolverClassifyFallback(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	localIP, externalIP := "10.10.0.1", "10.20.0.2"
@@ -92,7 +92,7 @@ func TestRoutingResolverClassifyFallback(t *testing.T) {
 
 // TestRoutingResolverUpstreamFailover 第一个上游拒绝连接时应顺序尝试第二个。
 func TestRoutingResolverUpstreamFailover(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	ip := "10.30.0.3"
@@ -120,7 +120,7 @@ func TestRoutingResolverUpstreamFailover(t *testing.T) {
 
 // TestRoutingResolverAllLocalUpstreamsFail 全部境内上游失败时返回错误而非挂起。
 func TestRoutingResolverAllLocalUpstreamsFail(t *testing.T) {
-	if _, _, err := loadDomainLists("", ""); err != nil {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	r := &routingResolver{

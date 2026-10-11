@@ -5,6 +5,8 @@ import (
 	"errors"
 	"flag"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -173,10 +175,11 @@ func exchangeOne(ctx context.Context, u exchangeClient, req *dns.Msg, timeout ti
 	return u.Exchange(callCtx, req)
 }
 
-// reload 重新加载内置与外部域名列表、热替换 resolver 的分流树与 GeoIP 库，
-// 并清空响应缓存，使新规则对下一次查询立即生效。列表文件读取失败时保留旧状态。
-func (r *routingResolver) reload(chinaFile, gfwFile, geoFile string) (chinaN, gfwN int, err error) {
-	chinaN, gfwN, err = loadDomainLists(chinaFile, gfwFile)
+// reload 重新加载内置、远端与用户附加的域名列表，热替换 resolver 的分流树与
+// GeoIP 库，并清空响应缓存，使新规则对下一次查询立即生效。
+// 任一文件读取失败时整体放弃并保留旧状态。
+func (r *routingResolver) reload(chinaFiles, gfwFiles []string, geoFile string) (chinaN, gfwN int, err error) {
+	chinaN, gfwN, err = loadDomainLists(chinaFiles, gfwFiles)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -204,6 +207,8 @@ func main() {
 	timeout := flag.Int("timeout", 5000, "wait response timeout in ms")
 	chinaFile := flag.String("china", "", "extra china domain list")
 	gfwFile := flag.String("gfw", "", "extra blocked domain list")
+	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists at this interval (e.g. 24h); 0 disables")
+	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	loglevel := flag.String("loglevel", "info", "log level")
@@ -238,7 +243,21 @@ func main() {
 
 	timeoutD := time.Duration(*timeout) * time.Millisecond
 
-	chinaN, gfwN, err := loadDomainLists(*chinaFile, *gfwFile)
+	if *updateEvery > 0 {
+		if err := os.MkdirAll(*updateDir, 0o755); err != nil {
+			loggo.Error("create update dir %v", err)
+			return
+		}
+	}
+	// 远端列表（若已存在）+ 用户附加文件，二者都合并进内置集合。
+	remoteChinaPath := filepath.Join(*updateDir, remoteChinaFile)
+	remoteGfwPath := filepath.Join(*updateDir, remoteGfwFile)
+	userChinaFiles := []string{*chinaFile}
+	userGfwFiles := []string{*gfwFile}
+
+	chinaN, gfwN, err := loadDomainLists(
+		append(remoteIfExist(remoteChinaPath), userChinaFiles...),
+		append(remoteIfExist(remoteGfwPath), userGfwFiles...))
 	if err != nil {
 		loggo.Error("load domain list %v", err)
 		return
@@ -262,12 +281,6 @@ func main() {
 	cfg.RegionCode = *localregion
 	cfg.DirectDomains = domainKeys(doms.china)
 	cfg.ProxyDomains = domainKeys(doms.gfw)
-	if *chinaFile != "" {
-		cfg.DirectDomainFiles = []string{*chinaFile}
-	}
-	if *gfwFile != "" {
-		cfg.ProxyDomainFiles = []string{*gfwFile}
-	}
 	cfg.Timeout = timeoutD
 
 	localUpstreams, err := buildUpstreams(*localserer, timeoutD)
@@ -300,10 +313,35 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
+	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
+		return rr.reload(chinaFiles, gfwFiles, *localregionfile)
+	}
+
+	if *updateEvery > 0 {
+		u := &updater{
+			chinaURL:   defaultChinaListURL,
+			gfwURL:     defaultGFWListURL,
+			dir:        *updateDir,
+			interval:   *updateEvery,
+			apply:      apply,
+			extraChina: userChinaFiles,
+			extraGfw:   userGfwFiles,
+		}
+		go u.run()
+		loggo.Info("auto update enabled, interval %v, dir %s", *updateEvery, *updateDir)
+	}
+
 	done := make(chan struct{})
+	// HUP 重载的范围与启动一致：已落盘的远端列表 + 用户附加文件，
+	// 否则 HUP 会把自动更新已生效的规则悄悄回退。
+	reloadAll := func() (int, int, error) {
+		return apply(
+			append(remoteIfExist(remoteChinaPath), userChinaFiles...),
+			append(remoteIfExist(remoteGfwPath), userGfwFiles...))
+	}
 	setupSignalHandler(
 		func() {
-			cn, gfw, e := rr.reload(*chinaFile, *gfwFile, *localregionfile)
+			cn, gfw, e := reloadAll()
 			if e != nil {
 				loggo.Error("reload fail, keep old rules: %v", e)
 				return
