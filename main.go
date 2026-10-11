@@ -129,6 +129,13 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	q := req.Question[0]
 	metrics.observeQuery(q.Qtype)
 
+	// 静态 hosts 规则优先级最高，命中即合成应答，不查任何上游。
+	if resp, ok := hostsAnswer(req); ok {
+		metrics.hostsHits.Add(1)
+		loggo.Info("route hosts %s", q.Name)
+		return resp, nil
+	}
+
 	mode := classifyName(q.Name)
 	if mode == routeExtern && externShadowedHit(q.Name) {
 		loggo.Info("route %s %s", routeName(routeExtern), q.Name)
@@ -182,14 +189,20 @@ func exchangeOne(ctx context.Context, u exchangeClient, req *dns.Msg, timeout ti
 	return u.Exchange(callCtx, req)
 }
 
-// reload 重新加载内置、远端与用户附加的域名列表，热替换 resolver 的分流树与
-// GeoIP 库，并清空响应缓存，使新规则对下一次查询立即生效。
+// reload 重新加载内置、远端与用户附加的域名列表及 hosts 规则，热替换 resolver
+// 的分流树与 GeoIP 库，并清空响应缓存，使新规则对下一次查询立即生效。
 // 任一文件读取失败时整体放弃并保留旧状态。
-func (r *routingResolver) reload(chinaFiles, gfwFiles []string, geoFile string) (chinaN, gfwN int, err error) {
+func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoFile string) (chinaN, gfwN int, err error) {
+	// 两份规则都先解析成功再依次替换快照：任一失败，旧状态完整保留。
+	hostsSnap, err := parseHostsFiles(hostsFiles)
+	if err != nil {
+		return 0, 0, err
+	}
 	chinaN, gfwN, err = loadDomainLists(chinaFiles, gfwFiles)
 	if err != nil {
 		return 0, 0, err
 	}
+	hostsState.Store(hostsSnap)
 	d := currentDomains()
 	if r.inner != nil {
 		r.inner.UpdateDirectDomains(domainKeys(d.china))
@@ -214,6 +227,7 @@ func main() {
 	timeout := flag.Int("timeout", 5000, "wait response timeout in ms")
 	chinaFile := flag.String("china", "", "extra china domain list")
 	gfwFile := flag.String("gfw", "", "extra blocked domain list")
+	hostsFile := flag.String("hosts", "", "static hosts file (standard hosts format or dnsmasq address=/name/ip lines)")
 	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists at this interval (e.g. 24h); 0 disables")
 	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
@@ -263,6 +277,14 @@ func main() {
 	remoteGfwPath := filepath.Join(*updateDir, remoteGfwFile)
 	userChinaFiles := []string{*chinaFile}
 	userGfwFiles := []string{*gfwFile}
+	userHostsFiles := []string{*hostsFile}
+
+	hostsN, err := loadHosts(userHostsFiles)
+	if err != nil {
+		loggo.Error("load hosts file %v", err)
+		return
+	}
+	loggo.Info("hosts rules %d", hostsN)
 
 	chinaN, gfwN, err := loadDomainLists(
 		append(remoteIfExist(remoteChinaPath), userChinaFiles...),
@@ -336,7 +358,7 @@ func main() {
 	}
 
 	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
-		return rr.reload(chinaFiles, gfwFiles, *localregionfile)
+		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, *localregionfile)
 	}
 
 	if *updateEvery > 0 {

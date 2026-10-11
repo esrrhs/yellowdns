@@ -75,7 +75,7 @@ func TestReloadPicksUpExtraFile(t *testing.T) {
 	f.Close()
 
 	r := &routingResolver{} // inner 为 nil：只验证规则快照热替换
-	cn, _, err := r.reload([]string{f.Name()}, nil, "GeoLite2-Country.mmdb")
+	cn, _, err := r.reload([]string{f.Name()}, nil, nil, "GeoLite2-Country.mmdb")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestReloadPicksUpExtraFile(t *testing.T) {
 
 	// 坏文件不能破坏现有快照
 	before := currentDomains()
-	if _, _, err := r.reload([]string{"/no/such/file"}, nil, ""); err == nil {
+	if _, _, err := r.reload([]string{"/no/such/file"}, nil, nil, ""); err == nil {
 		t.Fatal("missing file should fail reload")
 	}
 	if currentDomains() != before {
