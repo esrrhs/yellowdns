@@ -78,8 +78,18 @@ func splitUpstreams(spec string) []string {
 	return list
 }
 
+// namedUpstream 给兜底/绕行路径的上游绑定组名（local/extern）与配置地址，
+// 使分上游指标能按配置项归因；同名组合下地址相同的项共享同一组计数器。
+type namedUpstream struct {
+	name  string
+	group string
+	stats *perUpstreamCounters
+	exchangeClient
+}
+
 // buildUpstreams 构造兜底路径的上游列表，非法地址跳过并告警，全部非法时报错。
-func buildUpstreams(spec string, timeout time.Duration) ([]exchangeClient, error) {
+// group 为 "local" 或 "extern"，仅用于指标归因。
+func buildUpstreams(group, spec string, timeout time.Duration) ([]exchangeClient, error) {
 	addrs := splitUpstreams(spec)
 	if len(addrs) == 0 {
 		return nil, errors.New("empty upstream list")
@@ -91,12 +101,26 @@ func buildUpstreams(spec string, timeout time.Duration) ([]exchangeClient, error
 			loggo.Warn("skip invalid upstream %q: %v", addr, err)
 			continue
 		}
-		list = append(list, u)
+		name := addr
+		if c, ok := u.(*socketClient); ok {
+			name = c.addr // socket 上游用补全端口后的实际地址
+		}
+		list = append(list, &namedUpstream{
+			name:           name,
+			group:          group,
+			stats:          registerUpstream(group, name),
+			exchangeClient: u,
+		})
 	}
 	if len(list) == 0 {
 		return nil, errors.New("no valid upstream in " + spec)
 	}
 	return list, nil
+}
+
+// observe 记录一次该上游的兜底查询结果（成功/失败、耗时、错误摘要）。
+func (u *namedUpstream) observe(ok bool, d time.Duration, err error) {
+	u.stats.record(ok, d, err)
 }
 
 // withPort 为缺省端口的上游地址补 ":53"，与 gohome 上游的宽容解析保持一致。
@@ -122,7 +146,13 @@ type routingResolver struct {
 	timeout  time.Duration
 }
 
-func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+	start := time.Now()
+	// routeLabel 记录最终走的路由，供端到端延迟直方图归因。
+	routeLabel := routeAutoLabel
+	defer func() {
+		metrics.observeLatency(routeLabel, time.Since(start))
+	}()
 	if len(req.Question) == 0 {
 		return nil, errors.New("empty dns question")
 	}
@@ -130,13 +160,15 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	metrics.observeQuery(q.Qtype)
 
 	// 静态 hosts 规则优先级最高，命中即合成应答，不查任何上游。
-	if resp, ok := hostsAnswer(req); ok {
+	if hit, ok := hostsAnswer(req); ok {
 		metrics.hostsHits.Add(1)
+		routeLabel = routeHostsLabel
 		loggo.Info("route hosts %s", q.Name)
-		return resp, nil
+		return hit, nil
 	}
 
 	mode := classifyName(q.Name)
+	routeLabel = routeLabelOf(mode)
 	if mode == routeExtern && externShadowedHit(q.Name) {
 		loggo.Info("route %s %s", routeName(routeExtern), q.Name)
 		metrics.observeRoute(routeExtern, true)
@@ -144,7 +176,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 	}
 
 	if r.inner != nil {
-		resp, err := r.inner.Exchange(ctx, req)
+		resp, err = r.inner.Exchange(ctx, req)
 		if err == nil && resp != nil {
 			metrics.observeRoute(mode, false)
 			return resp, nil
@@ -167,7 +199,12 @@ func exchangeList(ctx context.Context, list []exchangeClient, req *dns.Msg, time
 	var lastErr error
 	for _, u := range list {
 		metrics.upAttempts.Add(1)
+		start := time.Now()
 		resp, err := exchangeOne(ctx, u, req, timeout)
+		elapsed := time.Since(start)
+		if named, ok := u.(*namedUpstream); ok {
+			named.observe(err == nil && resp != nil, elapsed, err)
+		}
 		if err == nil && resp != nil {
 			return resp, nil
 		}
@@ -357,12 +394,12 @@ func main() {
 	cfg.ProxyDomains = domainKeys(doms.gfw)
 	cfg.Timeout = timeoutD
 
-	localUpstreams, err := buildUpstreams(*localserer, timeoutD)
+	localUpstreams, err := buildUpstreams("local", *localserer, timeoutD)
 	if err != nil {
 		loggo.Error("local upstream %v", err)
 		return
 	}
-	externalUpstreams, err := buildUpstreams(*externalserver, timeoutD)
+	externalUpstreams, err := buildUpstreams("extern", *externalserver, timeoutD)
 	if err != nil {
 		loggo.Error("external upstream %v", err)
 		return

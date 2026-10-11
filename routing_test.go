@@ -135,3 +135,74 @@ func TestRoutingResolverAllLocalUpstreamsFail(t *testing.T) {
 		t.Fatal("all upstreams failing must return an error")
 	}
 }
+
+// TestRoutingPerServerMetrics 端到端验证：经 Exchange 兜底后，分上游计数器按
+// group/name 记录成功、失败与延迟，路由延迟直方图也产生样本。
+func TestRoutingPerServerMetrics(t *testing.T) {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+
+	ip := "10.40.0.4"
+	goodAddr := startFakeUDPDNS(t, ip)
+	r := &routingResolver{
+		local: []exchangeClient{
+			&namedUpstream{
+				name:           "127.0.0.1:9",
+				group:          "local",
+				stats:          registerUpstream("local", "127.0.0.1:9"),
+				exchangeClient: newSocketClient("127.0.0.1:9", 200*time.Millisecond),
+			},
+			&namedUpstream{
+				name:           goodAddr,
+				group:          "local",
+				stats:          registerUpstream("local", goodAddr),
+				exchangeClient: newSocketClient(goodAddr, time.Second),
+			},
+		},
+		external: []exchangeClient{
+			&namedUpstream{
+				name:           "127.0.0.1:10",
+				group:          "extern",
+				stats:          registerUpstream("extern", "127.0.0.1:10"),
+				exchangeClient: newSocketClient("127.0.0.1:10", 200*time.Millisecond),
+			},
+		},
+		timeout: time.Second,
+	}
+
+	// baidu -> local 兜底：首个上游失败、第二个成功；google -> extern 失败一次。
+	if got := queryA(t, r, "www.baidu.com"); got != ip {
+		t.Fatalf("answer = %s, want %s", got, ip)
+	}
+	req := new(dns.Msg)
+	req.SetQuestion("www.google.com.", dns.TypeA)
+	_, _ = r.Exchange(context.Background(), req)
+
+	snap := metrics.snapshot()
+	byName := map[string]upstreamServerSnapshot{}
+	for _, srv := range snap.Upstreams.Servers {
+		byName[srv.Name] = srv
+	}
+	bad := byName["127.0.0.1:9"]
+	if bad.Attempts != 1 || bad.Errors != 1 || bad.LastSuccess != 0 || bad.LastError == "" {
+		t.Fatalf("failing local upstream stats = %+v", bad)
+	}
+	good := byName[goodAddr]
+	if good.Attempts != 1 || good.Errors != 0 || good.LastSuccess == 0 || good.Latency.Count != 1 {
+		t.Fatalf("successful local upstream stats = %+v", good)
+	}
+	ext := byName["127.0.0.1:10"]
+	if ext.Attempts != 1 || ext.Errors != 1 || ext.Group != "extern" {
+		t.Fatalf("extern upstream stats = %+v", ext)
+	}
+	if snap.Upstreams.Attempts != 3 || snap.Upstreams.Errors != 2 {
+		t.Fatalf("aggregate attempts/errors = %d/%d, want 3/2", snap.Upstreams.Attempts, snap.Upstreams.Errors)
+	}
+	// baidu 归 local，google 归 extern；每次 Exchange 无论成败都产生一个延迟样本。
+	if snap.Queries.Latency["local"].Count < 1 || snap.Queries.Latency["extern"].Count < 1 {
+		t.Fatalf("route latency counts missing: %+v", snap.Queries.Latency)
+	}
+}
