@@ -355,6 +355,10 @@ func (u *updater) updateGeo() (bool, error) {
 		_ = os.Remove(tmp)
 		return false, err
 	}
+	if err := refreshGeoMeta(dst); err != nil {
+		// 元信息只影响可观测性：文件本身已校验并落盘，刷新指标失败不把本次更新判为失败。
+		loggo.Warn("refresh geoip metadata fail: %v", err)
+	}
 	loggo.Info("geoip database updated (%d bytes)", len(mmdb))
 	return true, nil
 }
@@ -367,6 +371,43 @@ func validateMMDB(data []byte) error {
 		return err
 	}
 	return r.Close()
+}
+
+// geoMetaInfo 是当前在役 GeoIP 库文件的新鲜度快照，仅在启动加载与更新落盘时采集，
+// 避免 /stats 每次抓取都去 mmap+解析 8MB 数据库。
+type geoMetaInfo struct {
+	path     string    // 文件路径
+	dbType   string    // mmdb metadata database_type（如 DBIP-Country-Lite）
+	size     int64     // 文件字节数
+	modified time.Time // 文件 mtime（落盘时间）
+	build    time.Time // mmdb metadata build_epoch（发行方构建时间）
+}
+
+// geoMetaPtr 保存最新一份库元信息；从未成功加载时为 nil。
+var geoMetaPtr atomic.Pointer[geoMetaInfo]
+
+// refreshGeoMeta 采集磁盘上 GeoIP 库的 mtime/大小与 mmdb metadata 并原子替换快照。
+// geoip2.Open 只 mmap 并解码尾部 metadata，不解析整库；任何失败保持旧快照不变。
+func refreshGeoMeta(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	r, err := geoip2.Open(path)
+	if err != nil {
+		return err
+	}
+	meta := r.Metadata()
+	info := &geoMetaInfo{
+		path:     path,
+		dbType:   meta.DatabaseType,
+		size:     st.Size(),
+		modified: st.ModTime(),
+		build:    time.Unix(int64(meta.BuildEpoch), 0),
+	}
+	_ = r.Close()
+	geoMetaPtr.Store(info)
+	return nil
 }
 
 func (u *updater) fetch(url string) ([]byte, error) {

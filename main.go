@@ -147,6 +147,8 @@ type routingResolver struct {
 }
 
 func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
+	metrics.inFlight.Add(1)
+	defer metrics.inFlight.Add(-1)
 	start := time.Now()
 	// routeLabel 记录最终走的路由，供端到端延迟直方图归因。
 	routeLabel := routeAutoLabel
@@ -445,6 +447,11 @@ func main() {
 			return p[0]
 		}
 		return *localregionfile
+	}
+	// 采集当前在役库的新鲜度元信息供 /stats 暴露；无库或损坏时保持 loaded=false，
+	// 不影响服务启动（后续成功更新会再次采集）。
+	if err := refreshGeoMeta(currentGeoFile()); err != nil {
+		loggo.Debug("capture geoip metadata fail: %v", err)
 	}
 	apply := func(chinaFiles, gfwFiles []string, gf string) (int, int, int, error) {
 		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, gf)
