@@ -1,8 +1,0 @@
-[WARN] [2026-10-10T23:08:25.850935+08:00] [resolver.go:211] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
-[WARN] [2026-10-10T23:08:25.867118+08:00] [resolver.go:221] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid remote upstream ":53": invalid upstream address ":53": empty host
-[WARN] [2026-10-10T23:08:26.180876+08:00] [resolver.go:189] [github.com/esrrhs/gohome/dns.NewResolver] [DNS] Load GeoIP failed: invalid argument
-[WARN] [2026-10-10T23:08:26.486114+08:00] [resolver.go:221] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid remote upstream ":53": invalid upstream address ":53": empty host
-[WARN] [2026-10-10T23:10:43.020432+08:00] [resolver.go:217] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid direct upstream "223.5.5.5:notaport": invalid upstream address "223.5.5.5:notaport": bad port "notaport"
-[WARN] [2026-10-10T23:10:43.028674+08:00] [resolver.go:227] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid remote upstream ":53": invalid upstream address ":53": empty host
-[WARN] [2026-10-10T23:10:43.352469+08:00] [resolver.go:195] [github.com/esrrhs/gohome/dns.NewResolver] [DNS] Load GeoIP failed: invalid argument
-[WARN] [2026-10-10T23:10:43.659313+08:00] [resolver.go:227] [github.com/esrrhs/gohome/dns.(*StandardResolver).initUpstreams] [DNS] skip invalid remote upstream ":53": invalid upstream address ":53": empty host

@@ -267,15 +267,18 @@ func TestReadyzHandler(t *testing.T) {
 	}
 }
 
-// stubCacheResolver 只覆盖缓存相关两个方法，其余接口方法由内嵌 nil 接口提升
+// stubCacheResolver 只覆盖缓存相关方法，其余接口方法由内嵌 nil 接口提升
 // （这些路径在本测试中不会被调用）。
 type stubCacheResolver struct {
 	gohomedns.Resolver
-	n int
+	n            int
+	hits, misses int64
 }
 
-func (s *stubCacheResolver) CacheLen() int { return s.n }
-func (s *stubCacheResolver) ClearCache()   { s.n = 0 }
+func (s *stubCacheResolver) CacheLen() int      { return s.n }
+func (s *stubCacheResolver) ClearCache()        { s.n = 0 }
+func (s *stubCacheResolver) CacheHits() int64   { return s.hits }
+func (s *stubCacheResolver) CacheMisses() int64 { return s.misses }
 
 func TestRoutingResolverCache(t *testing.T) {
 	// inner 为 nil（gohome 初始化失败的兜底模式）时不 panic，按 0 处理。
@@ -283,11 +286,17 @@ func TestRoutingResolverCache(t *testing.T) {
 	if rr.cacheLen() != 0 || rr.flushCache() != 0 {
 		t.Fatal("nil inner should report zero cache and flush nothing")
 	}
+	if n, hits, misses := rr.cacheStats(); n != 0 || hits != 0 || misses != 0 {
+		t.Fatalf("nil inner cacheStats = %d/%d/%d, want all zero", n, hits, misses)
+	}
 
-	stub := &stubCacheResolver{n: 5}
+	stub := &stubCacheResolver{n: 5, hits: 8, misses: 2}
 	rr = &routingResolver{inner: stub}
 	if got := rr.cacheLen(); got != 5 {
 		t.Fatalf("cacheLen = %d, want 5", got)
+	}
+	if n, hits, misses := rr.cacheStats(); n != 5 || hits != 8 || misses != 2 {
+		t.Fatalf("cacheStats = %d/%d/%d, want 5/8/2", n, hits, misses)
 	}
 	if got := rr.flushCache(); got != 5 {
 		t.Fatalf("flushCache returned %d, want 5", got)
@@ -351,9 +360,9 @@ func TestCacheFlushHandler(t *testing.T) {
 }
 
 func TestCacheObservability(t *testing.T) {
-	old := cacheStatus
-	cacheStatus = func() int { return 42 }
-	t.Cleanup(func() { cacheStatus = old })
+	old := cacheStats
+	cacheStats = func() (int, int64, int64) { return 42, 30, 10 } // 75% 命中率
+	t.Cleanup(func() { cacheStats = old })
 	metrics.reset()
 	t.Cleanup(metrics.reset)
 	metrics.cacheFlushes.Add(3)
@@ -365,8 +374,12 @@ func TestCacheObservability(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.Cache.Entries != 42 || snap.Cache.Flushes != 3 {
-		t.Fatalf("cache snapshot = %+v, want entries 42 flushes 3", snap.Cache)
+	if snap.Cache.Entries != 42 || snap.Cache.Flushes != 3 ||
+		snap.Cache.Hits != 30 || snap.Cache.Misses != 10 {
+		t.Fatalf("cache snapshot = %+v, want entries 42 flushes 3 hits 30 misses 10", snap.Cache)
+	}
+	if snap.Cache.HitRatio != 0.75 {
+		t.Fatalf("hit_ratio = %v, want 0.75", snap.Cache.HitRatio)
 	}
 
 	recM := httptest.NewRecorder()
@@ -375,6 +388,10 @@ func TestCacheObservability(t *testing.T) {
 	for _, want := range []string{
 		"# TYPE yellowdns_cache_entries gauge",
 		"yellowdns_cache_entries 42",
+		"# TYPE yellowdns_cache_hits_total counter",
+		"yellowdns_cache_hits_total 30",
+		"# TYPE yellowdns_cache_misses_total counter",
+		"yellowdns_cache_misses_total 10",
 		"# TYPE yellowdns_cache_flushes_total counter",
 		"yellowdns_cache_flushes_total 3",
 	} {
@@ -442,6 +459,61 @@ func TestStatsRoutingCounters(t *testing.T) {
 	// 2 次成功 + 1 次无 answer 的 AAAA + 1 次死上游失败 = 4 次尝试，1 次错误
 	if snap.Upstreams.Attempts != 4 || snap.Upstreams.Errors != 1 {
 		t.Errorf("upstreams = %+v, want attempts 4 errors 1", snap.Upstreams)
+	}
+	// 假上游对 A/AAAA 都回 NOERROR（AAAA 仅无 answer），死上游返回错误无应答。
+	if snap.Queries.Rcodes.NoError != 3 || snap.Queries.Errors != 1 {
+		t.Errorf("results = noerror %d errors %d, want 3/1", snap.Queries.Rcodes.NoError, snap.Queries.Errors)
+	}
+}
+
+// TestObserveResult 直接验证应答结果分类：各 rcode、错误/无应答、TC 截断。
+func TestObserveResult(t *testing.T) {
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+	msg := func(rcode int, truncated bool) *dns.Msg {
+		m := new(dns.Msg)
+		m.Rcode = rcode
+		m.Truncated = truncated
+		return m
+	}
+	metrics.observeResult(msg(dns.RcodeSuccess, false), nil)
+	metrics.observeResult(msg(dns.RcodeSuccess, true), nil) // 截断的成功应答同时计 truncated
+	metrics.observeResult(msg(dns.RcodeNameError, false), nil)
+	metrics.observeResult(msg(dns.RcodeServerFailure, false), nil)
+	metrics.observeResult(msg(dns.RcodeRefused, false), nil)
+	metrics.observeResult(msg(dns.RcodeFormatError, false), nil) // 其他 rcode
+	metrics.observeResult(nil, errors.New("boom"))
+	metrics.observeResult(msg(dns.RcodeSuccess, false), errors.New("late error")) // 有错误优先计 error
+
+	snap := metrics.snapshot()
+	r := snap.Queries.Rcodes
+	if r.NoError != 2 || r.NXDomain != 1 || r.ServFail != 1 || r.Refused != 1 || r.Other != 1 {
+		t.Fatalf("rcode counts = %+v", r)
+	}
+	if snap.Queries.Truncated != 1 {
+		t.Fatalf("truncated = %d, want 1", snap.Queries.Truncated)
+	}
+	if snap.Queries.Errors != 2 {
+		t.Fatalf("errors = %d, want 2", snap.Queries.Errors)
+	}
+
+	// Prometheus 输出包含各 rcode 序列与错误/截断指标。
+	s := &statsServer{}
+	rec := httptest.NewRecorder()
+	s.metricsHandler(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`yellowdns_responses_total{rcode="noerror"} 2`,
+		`yellowdns_responses_total{rcode="nxdomain"} 1`,
+		`yellowdns_responses_total{rcode="servfail"} 1`,
+		`yellowdns_responses_total{rcode="refused"} 1`,
+		`yellowdns_responses_total{rcode="other"} 1`,
+		`yellowdns_query_errors_total 2`,
+		`yellowdns_response_truncated_total 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q", want)
+		}
 	}
 }
 

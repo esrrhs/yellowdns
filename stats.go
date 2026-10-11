@@ -41,12 +41,23 @@ type statsCounters struct {
 	upAttempts   atomic.Int64 // 上游尝试次数（含 failover 重试）
 	upErrors     atomic.Int64 // 上游单次尝试失败次数
 	cacheFlushes atomic.Int64 // 通过 POST /cache/flush 主动清缓存的次数
+
+	// 应答结果维度：Exchange 返回错误（或无应答）计 qErrors；
+	// 有应答时按 Rcode 归类，并统计 TC 截断（UDP 超限需走 TCP 的信号）。
+	qErrors    atomic.Int64
+	truncated  atomic.Int64
+	rcNoerror  atomic.Int64
+	rcNxdomain atomic.Int64
+	rcServfail atomic.Int64
+	rcRefused  atomic.Int64
+	rcOther    atomic.Int64
 }
 
 var metrics = &statsCounters{}
 
-// cacheStatus 由 main 注入，返回 resolver 当前响应缓存条目数；未注入时按 0 输出。
-var cacheStatus func() int
+// cacheStats 由 main 注入，返回 resolver 响应缓存的当前条目数与累计命中/未命中次数；
+// 未注入时全部按 0 输出。
+var cacheStats func() (entries int, hits, misses int64)
 
 // updateStatusInfo 由 main 注入，返回自动更新是否启用与检查间隔；未注入时按禁用输出。
 var updateStatusInfo func() (enabled bool, interval time.Duration)
@@ -88,6 +99,29 @@ func (s *statsCounters) observeRoute(mode int, shadowed bool) {
 // observeLatency 记录一次端到端查询耗时，按最终路由归入对应直方图。
 func (s *statsCounters) observeLatency(route string, d time.Duration) {
 	routeLatencies.observe(route, d)
+}
+
+// observeResult 记录一次查询的最终结果：错误（无应答）或应答 Rcode/TC 位。
+func (s *statsCounters) observeResult(resp *dns.Msg, err error) {
+	if err != nil || resp == nil {
+		s.qErrors.Add(1)
+		return
+	}
+	if resp.Truncated {
+		s.truncated.Add(1)
+	}
+	switch resp.Rcode {
+	case dns.RcodeSuccess:
+		s.rcNoerror.Add(1)
+	case dns.RcodeNameError:
+		s.rcNxdomain.Add(1)
+	case dns.RcodeServerFailure:
+		s.rcServfail.Add(1)
+	case dns.RcodeRefused:
+		s.rcRefused.Add(1)
+	default:
+		s.rcOther.Add(1)
+	}
 }
 
 // 路由标签：与 domainlist 的 route* 常量及 hosts 合成应答路径对应。
@@ -370,14 +404,23 @@ type statsSnapshot struct {
 		Hosts    int `json:"hosts"`
 	} `json:"domains"`
 	Queries struct {
-		Total    int64                      `json:"total"`
-		Local    int64                      `json:"local"`
-		Extern   int64                      `json:"extern"`
-		Auto     int64                      `json:"auto"`
-		Shadowed int64                      `json:"shadowed"`
-		Fallback int64                      `json:"fallback"`
-		Hosts    int64                      `json:"hosts"`
-		Latency  map[string]latencySnapshot `json:"latency_ms"`
+		Total     int64 `json:"total"`
+		Local     int64 `json:"local"`
+		Extern    int64 `json:"extern"`
+		Auto      int64 `json:"auto"`
+		Shadowed  int64 `json:"shadowed"`
+		Fallback  int64 `json:"fallback"`
+		Hosts     int64 `json:"hosts"`
+		Errors    int64 `json:"errors"`    // Exchange 返回错误/无应答的查询数
+		Truncated int64 `json:"truncated"` // TC 位置位的应答数（提示需走 TCP）
+		Rcodes    struct {
+			NoError  int64 `json:"noerror"`
+			NXDomain int64 `json:"nxdomain"`
+			ServFail int64 `json:"servfail"`
+			Refused  int64 `json:"refused"`
+			Other    int64 `json:"other"`
+		} `json:"responses_by_rcode"`
+		Latency map[string]latencySnapshot `json:"latency_ms"`
 	} `json:"queries"`
 	Upstreams struct {
 		Attempts int64                    `json:"attempts"`
@@ -385,8 +428,11 @@ type statsSnapshot struct {
 		Servers  []upstreamServerSnapshot `json:"servers"`
 	} `json:"upstreams"`
 	Cache struct {
-		Entries int   `json:"entries"` // resolver 响应缓存当前条目（含未懒清理的过期项）
-		Flushes int64 `json:"flushes"` // 主动 flush 次数
+		Entries  int     `json:"entries"`   // resolver 响应缓存当前条目（含未懒清理的过期项）
+		Hits     int64   `json:"hits"`      // 累计缓存命中
+		Misses   int64   `json:"misses"`    // 累计缓存未命中（含过期）
+		HitRatio float64 `json:"hit_ratio"` // hits/(hits+misses)，无查找时为 0
+		Flushes  int64   `json:"flushes"`   // 主动 flush 次数
 	} `json:"cache"`
 	Qtypes struct {
 		A     int64 `json:"A"`
@@ -417,6 +463,13 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Queries.Shadowed = s.shadowed.Load()
 	snap.Queries.Fallback = s.fallback.Load()
 	snap.Queries.Hosts = s.hostsHits.Load()
+	snap.Queries.Errors = s.qErrors.Load()
+	snap.Queries.Truncated = s.truncated.Load()
+	snap.Queries.Rcodes.NoError = s.rcNoerror.Load()
+	snap.Queries.Rcodes.NXDomain = s.rcNxdomain.Load()
+	snap.Queries.Rcodes.ServFail = s.rcServfail.Load()
+	snap.Queries.Rcodes.Refused = s.rcRefused.Load()
+	snap.Queries.Rcodes.Other = s.rcOther.Load()
 	snap.Upstreams.Attempts = s.upAttempts.Load()
 	snap.Upstreams.Errors = s.upErrors.Load()
 	snap.Upstreams.Servers = upstreamRegistry.snapshot()
@@ -424,8 +477,11 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	for _, route := range routeLatencies.order {
 		snap.Queries.Latency[route] = routeLatencies.m[route].snapshot()
 	}
-	if cacheStatus != nil {
-		snap.Cache.Entries = cacheStatus()
+	if cacheStats != nil {
+		snap.Cache.Entries, snap.Cache.Hits, snap.Cache.Misses = cacheStats()
+		if lookups := snap.Cache.Hits + snap.Cache.Misses; lookups > 0 {
+			snap.Cache.HitRatio = float64(snap.Cache.Hits) / float64(lookups)
+		}
 	}
 	snap.Cache.Flushes = s.cacheFlushes.Load()
 	snap.Qtypes.A = s.qtypeA.Load()
@@ -493,6 +549,17 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_queries_qtype_total{type=\"AAAA\"} %d\n", snap.Qtypes.AAAA)
 	fmt.Fprintf(&b, "yellowdns_queries_qtype_total{type=\"other\"} %d\n", snap.Qtypes.Other)
 
+	writeHelp("yellowdns_responses_total", "counter", "Queries answered, by DNS response code.")
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"noerror\"} %d\n", snap.Queries.Rcodes.NoError)
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"nxdomain\"} %d\n", snap.Queries.Rcodes.NXDomain)
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"servfail\"} %d\n", snap.Queries.Rcodes.ServFail)
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"refused\"} %d\n", snap.Queries.Rcodes.Refused)
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"other\"} %d\n", snap.Queries.Rcodes.Other)
+	writeHelp("yellowdns_query_errors_total", "counter", "Queries that ended with an error or no DNS response.")
+	fmt.Fprintf(&b, "yellowdns_query_errors_total %d\n", snap.Queries.Errors)
+	writeHelp("yellowdns_response_truncated_total", "counter", "Responses with the TC bit set (client should retry over TCP).")
+	fmt.Fprintf(&b, "yellowdns_response_truncated_total %d\n", snap.Queries.Truncated)
+
 	writeHelp("yellowdns_upstream_attempts_total", "counter", "Upstream exchange attempts, including failover retries.")
 	fmt.Fprintf(&b, "yellowdns_upstream_attempts_total %d\n", snap.Upstreams.Attempts)
 	writeHelp("yellowdns_upstream_errors_total", "counter", "Failed upstream exchange attempts.")
@@ -530,6 +597,10 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	writeHelp("yellowdns_cache_entries", "gauge", "DNS response cache entries currently held by the resolver.")
 	fmt.Fprintf(&b, "yellowdns_cache_entries %d\n", snap.Cache.Entries)
+	writeHelp("yellowdns_cache_hits_total", "counter", "Resolver cache lookups that hit a live entry.")
+	fmt.Fprintf(&b, "yellowdns_cache_hits_total %d\n", snap.Cache.Hits)
+	writeHelp("yellowdns_cache_misses_total", "counter", "Resolver cache lookups that missed (including expired entries).")
+	fmt.Fprintf(&b, "yellowdns_cache_misses_total %d\n", snap.Cache.Misses)
 	writeHelp("yellowdns_cache_flushes_total", "counter", "Explicit cache flushes triggered via POST /cache/flush.")
 	fmt.Fprintf(&b, "yellowdns_cache_flushes_total %d\n", snap.Cache.Flushes)
 

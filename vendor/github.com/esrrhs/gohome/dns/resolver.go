@@ -109,6 +109,9 @@ type Resolver interface {
 	ClearCache()
 	// CacheLen 返回当前 DNS 缓存条目数（可能含已过期但尚未懒清理的条目）
 	CacheLen() int
+	// CacheHits/CacheMisses 返回缓存查找命中/未命中的累计次数（ClearCache 不清零）
+	CacheHits() int64
+	CacheMisses() int64
 
 	// ---- 分流记录（记录实际发生过分流的域名及最终走向）----
 	// RoutedDomains 返回全部分流记录快照，按最近判定时间倒序；
@@ -501,6 +504,12 @@ func (r *StandardResolver) queryDirect(ctx context.Context, req *dns.Msg) (*dns.
 	upstreams := r.directUpstreams
 	r.mu.RUnlock()
 
+	if len(upstreams) == 0 {
+		// queryRemote 有同类守卫而这里没有：竞速退化路径在直连列表为空时
+		// 会落到下方 fmt.Errorf("%w", nil)，给调用方吐出 "%!w(<nil>)" 垃圾串。
+		return nil, errors.New("no direct upstreams configured")
+	}
+
 	var lastErr error
 	for _, u := range upstreams {
 		resp, err := u.Exchange(ctx, req)
@@ -509,7 +518,10 @@ func (r *StandardResolver) queryDirect(ctx context.Context, req *dns.Msg) (*dns.
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("all direct upstreams failed: %w", lastErr)
+	if lastErr != nil {
+		return nil, fmt.Errorf("all direct upstreams failed: %w", lastErr)
+	}
+	return nil, errors.New("all direct upstreams returned empty response")
 }
 
 func (r *StandardResolver) queryRemote(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
@@ -530,7 +542,10 @@ func (r *StandardResolver) queryRemote(ctx context.Context, req *dns.Msg) (*dns.
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("all remote upstreams failed: %w", lastErr)
+	if lastErr != nil {
+		return nil, fmt.Errorf("all remote upstreams failed: %w", lastErr)
+	}
+	return nil, errors.New("all remote upstreams returned empty response")
 }
 
 // queryParallel 并发查询国内与海外上游
@@ -770,6 +785,10 @@ func (r *StandardResolver) ClearCache() {
 func (r *StandardResolver) CacheLen() int {
 	return r.cache.Len()
 }
+
+// CacheHits/CacheMisses 返回 resolver 缓存查找的累计命中/未命中次数。
+func (r *StandardResolver) CacheHits() int64   { return r.cache.Hits() }
+func (r *StandardResolver) CacheMisses() int64 { return r.cache.Misses() }
 
 // recordRoute 是所有分流路径落盘记录的唯一入口；
 // routes 为 nil（关闭记录）时是空操作。
