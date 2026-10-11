@@ -65,6 +65,10 @@ var cacheStats func() (entries int, hits, misses int64)
 // staleStats 由 main 注入，返回 serve-stale 备份存储当前条目数；未注入时按 0 输出。
 var staleStats func() int
 
+// queryLogStatus 由 main 注入，返回查询日志是否启用及累计写入/丢弃条数；
+// 未注入时按禁用输出。丢弃条数非 0 表示磁盘跟不上查询速率。
+var queryLogStatus func() (enabled bool, written, dropped int64)
+
 // updateStatusInfo 由 main 注入，返回自动更新是否启用与检查间隔；未注入时按禁用输出。
 var updateStatusInfo func() (enabled bool, interval time.Duration)
 
@@ -434,14 +438,14 @@ type statsSnapshot struct {
 		Latency map[string]latencySnapshot `json:"latency_ms"`
 	} `json:"queries"`
 	GeoIP struct {
-		Loaded               bool   `json:"loaded"` // 启动/更新后是否成功采集过库元信息
-		Path                 string `json:"path"`
-		Type                 string `json:"type"`                    // mmdb database_type
-		SizeBytes            int64  `json:"size_bytes"`
-		ModifiedUnixSeconds  int64  `json:"modified_timestamp_seconds"` // 文件落盘时间
-		BuildUnixSeconds     int64  `json:"build_timestamp_seconds"`    // 发行方构建时间（build_epoch）
-		FileAgeSeconds       int64  `json:"file_age_seconds"`           // 距上次落盘
-		BuildAgeSeconds      int64  `json:"build_age_seconds"`          // 距发行方构建
+		Loaded              bool   `json:"loaded"` // 启动/更新后是否成功采集过库元信息
+		Path                string `json:"path"`
+		Type                string `json:"type"` // mmdb database_type
+		SizeBytes           int64  `json:"size_bytes"`
+		ModifiedUnixSeconds int64  `json:"modified_timestamp_seconds"` // 文件落盘时间
+		BuildUnixSeconds    int64  `json:"build_timestamp_seconds"`    // 发行方构建时间（build_epoch）
+		FileAgeSeconds      int64  `json:"file_age_seconds"`           // 距上次落盘
+		BuildAgeSeconds     int64  `json:"build_age_seconds"`          // 距发行方构建
 	} `json:"geoip"`
 	Upstreams struct {
 		Attempts int64                    `json:"attempts"`
@@ -462,6 +466,11 @@ type statsSnapshot struct {
 		AAAA  int64 `json:"AAAA"`
 		Other int64 `json:"other"`
 	} `json:"qtypes"`
+	QueryLog struct {
+		Enabled bool  `json:"enabled"` // 是否启用结构化查询日志
+		Written int64 `json:"written"` // 累计成功写入的查询日志行数
+		Dropped int64 `json:"dropped"` // 队列满被丢弃的日志数（磁盘跟不上的信号）
+	} `json:"query_log"`
 	Updates struct {
 		Enabled         bool                            `json:"enabled"`
 		IntervalSeconds int64                           `json:"interval_seconds"`
@@ -528,6 +537,9 @@ func (s *statsCounters) snapshot() statsSnapshot {
 		enabled, interval := updateStatusInfo()
 		snap.Updates.Enabled = enabled
 		snap.Updates.IntervalSeconds = int64(interval.Seconds())
+	}
+	if queryLogStatus != nil {
+		snap.QueryLog.Enabled, snap.QueryLog.Written, snap.QueryLog.Dropped = queryLogStatus()
 	}
 	chinaH, gfwH, geoH := updateMetrics.snapshot()
 	snap.Updates.Sources = map[string]updateSourceSnapshot{
@@ -657,6 +669,13 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_cache_stale_entries %d\n", snap.Cache.StaleEntries)
 	writeHelp("yellowdns_cache_stale_served_total", "counter", "Answers served from the stale backup after all upstreams failed (includes entries still within their clamped TTL floor).")
 	fmt.Fprintf(&b, "yellowdns_cache_stale_served_total %d\n", snap.Cache.StaleServed)
+
+	writeHelp("yellowdns_querylog_enabled", "gauge", "1 if structured query logging is enabled.")
+	fmt.Fprintf(&b, "yellowdns_querylog_enabled %d\n", boolToInt64(snap.QueryLog.Enabled))
+	writeHelp("yellowdns_querylog_written_total", "counter", "Query log lines successfully written.")
+	fmt.Fprintf(&b, "yellowdns_querylog_written_total %d\n", snap.QueryLog.Written)
+	writeHelp("yellowdns_querylog_dropped_total", "counter", "Query log lines dropped because the async queue was full (disk cannot keep up).")
+	fmt.Fprintf(&b, "yellowdns_querylog_dropped_total %d\n", snap.QueryLog.Dropped)
 
 	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
 	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")

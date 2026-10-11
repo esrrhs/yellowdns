@@ -153,6 +153,9 @@ type routingResolver struct {
 	staleTTL time.Duration
 	minTTL   time.Duration
 	maxTTL   time.Duration
+
+	// qlog 为可选的结构化查询日志；nil 表示关闭，recordQueryLog 直接跳过。
+	qlog *queryLogger
 }
 
 func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
@@ -161,9 +164,11 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	start := time.Now()
 	// routeLabel 记录最终走的路由，供端到端延迟直方图归因。
 	routeLabel := routeAutoLabel
+	servedStale := false
 	defer func() {
 		metrics.observeLatency(routeLabel, time.Since(start))
 		metrics.observeResult(resp, err)
+		r.recordQueryLog(ctx, req, servedStale, routeLabel, start, resp, err)
 	}()
 	if len(req.Question) == 0 {
 		return nil, errors.New("empty dns question")
@@ -189,6 +194,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 			return r.rememberAnswer(req, resp), nil
 		}
 		if stale, ok := r.serveStale(req); ok {
+			servedStale = true
 			return stale, nil
 		}
 		return nil, err
@@ -217,6 +223,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	// 所有上游都失败：若最近成功解析过该名字，在允许窗口内返回旧应答，
 	// 让断网/上游抖动期间的业务至少拿到一个大概率仍可用的地址。
 	if stale, ok := r.serveStale(req); ok {
+		servedStale = true
 		return stale, nil
 	}
 	return nil, err
@@ -386,6 +393,9 @@ func main() {
 	cacheMinTTL := flag.Duration("cache-min-ttl", 0, "floor TTL applied to every upstream answer before caching and replying (e.g. 60s); 0 disables")
 	cacheMaxTTL := flag.Duration("cache-max-ttl", 0, "ceiling TTL applied to every upstream answer before caching and replying (e.g. 24h); 0 disables")
 	serveStale := flag.Duration("serve-stale", 0, "when all upstreams fail, keep replying with the last good answer for this long past its TTL (e.g. 24h); stale replies carry a 5s TTL. 0 disables")
+	queryLogFile := flag.String("query-log", "", "write one JSON line per query to this file (e.g. query.log); '-' writes to stdout; empty disables. Rotated by size and reopened on SIGHUP")
+	queryLogMaxMB := flag.Int("query-log-max-mb", 100, "rotate the query log after it reaches this size in MiB; 0 disables size rotation")
+	queryLogMaxFiles := flag.Int("query-log-max-files", 5, "number of rotated query log files to keep (query.log.1 .. query.log.N)")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
@@ -428,6 +438,10 @@ func main() {
 	}
 	if *cacheMinTTL > 0 && *cacheMaxTTL > 0 && *cacheMinTTL > *cacheMaxTTL {
 		loggo.Error("-cache-min-ttl %v must not be greater than -cache-max-ttl %v", *cacheMinTTL, *cacheMaxTTL)
+		return
+	}
+	if *queryLogMaxMB < 0 || *queryLogMaxFiles < 0 {
+		loggo.Error("-query-log-max-mb and -query-log-max-files must not be negative")
 		return
 	}
 
@@ -519,6 +533,23 @@ func main() {
 		loggo.Warn("new gohome resolver error %v, classify fallback only", err)
 	}
 
+	// 查询日志为可选组件：文件打不开只影响审计，不应阻止 DNS 服务启动，
+	// 因此失败时告警并按关闭处理。
+	var qlog *queryLogger
+	if *queryLogFile != "" {
+		ql, err := newQueryLoggerWithLimit(
+			queryLogAbs(*queryLogFile),
+			int64(*queryLogMaxMB)*1024*1024,
+			*queryLogMaxFiles,
+		)
+		if err != nil {
+			loggo.Error("open query log %q fail: %v; query logging disabled", *queryLogFile, err)
+		} else {
+			qlog = ql
+			loggo.Info("query log enabled: %s (max %d MiB x %d files)", *queryLogFile, *queryLogMaxMB, *queryLogMaxFiles)
+		}
+	}
+
 	rr := &routingResolver{
 		inner:    res,
 		local:    localUpstreams,
@@ -528,10 +559,17 @@ func main() {
 		staleTTL: *serveStale,
 		minTTL:   *cacheMinTTL,
 		maxTTL:   *cacheMaxTTL,
+		qlog:     qlog,
 	}
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
 	cacheStats = rr.cacheStats
 	staleStats = rr.staleLen
+	if qlog != nil {
+		queryLogStatus = func() (enabled bool, written, dropped int64) {
+			w, d := qlog.stats()
+			return true, w, d
+		}
+	}
 	if *serveStale > 0 {
 		loggo.Info("serve-stale enabled: last good answer kept for %v past expiry", *serveStale)
 	}
@@ -608,6 +646,8 @@ func main() {
 				loggo.Error("reload fail, keep old rules: %v", e)
 				return
 			}
+			// 规则重载后重新打开查询日志，兼容外部 logrotate 的 rename+reopen 模式。
+			qlog.reopen()
 			loggo.Info("reload ok china %d gfw %d hosts %d shadowed %d", cn, gfw, hostsN, len(currentDomains().shadowed))
 		},
 		func() {
@@ -620,6 +660,8 @@ func main() {
 				time.Sleep(*shutdownDelay)
 			}
 			_ = srv.Stop()
+			// 监听器停止后不会再有新查询，排空查询日志队列再退出。
+			qlog.close(2 * time.Second)
 			if stats != nil {
 				stats.close()
 			}
