@@ -217,6 +217,7 @@ func main() {
 	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists at this interval (e.g. 24h); 0 disables")
 	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
+	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	loglevel := flag.String("loglevel", "info", "log level")
@@ -323,7 +324,15 @@ func main() {
 
 	var stats *statsServer
 	if *statsAddr != "" {
-		stats = startStatsServer(*statsAddr)
+		// flag 优先，环境变量兜底，避免 token 出现在进程参数中被 ps 看到。
+		token := *statsToken
+		if token == "" {
+			token = os.Getenv("YELLOWDNS_STATS_TOKEN")
+		}
+		if token == "" && !isLoopbackAddr(*statsAddr) {
+			loggo.Warn("stats endpoint on %s has no token and is not loopback-only; set -stats-token or YELLOWDNS_STATS_TOKEN", *statsAddr)
+		}
+		stats = startStatsServer(*statsAddr, token)
 	}
 
 	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
