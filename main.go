@@ -189,6 +189,24 @@ func exchangeOne(ctx context.Context, u exchangeClient, req *dns.Msg, timeout ti
 	return u.Exchange(callCtx, req)
 }
 
+// cacheLen 返回 gohome 响应缓存当前条目数；resolver 不可用时为 0。
+func (r *routingResolver) cacheLen() int {
+	if r.inner == nil {
+		return 0
+	}
+	return r.inner.CacheLen()
+}
+
+// flushCache 清空 gohome 响应缓存，返回清空前的条目数（供运维确认效果）。
+func (r *routingResolver) flushCache() int {
+	if r.inner == nil {
+		return 0
+	}
+	n := r.inner.CacheLen()
+	r.inner.ClearCache()
+	return n
+}
+
 // reload 重新加载内置、远端与用户附加的域名列表及 hosts 规则，热替换 resolver
 // 的分流树与 GeoIP 库，并清空响应缓存，使新规则对下一次查询立即生效。
 // 任一文件读取失败时整体放弃并保留旧状态。
@@ -352,6 +370,11 @@ func main() {
 		local:    localUpstreams,
 		external: externalUpstreams,
 		timeout:  timeoutD,
+	}
+	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
+	cacheStatus = rr.cacheLen
+	if stats != nil {
+		stats.flushCache = rr.flushCache
 	}
 
 	srv := gohomedns.NewServer(*listen, rr)

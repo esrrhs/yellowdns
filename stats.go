@@ -26,21 +26,25 @@ func isReady() bool { return ready.Load() }
 
 // statsCounters 是全进程查询统计，全部用原子计数，查询路径无锁累加。
 type statsCounters struct {
-	total       atomic.Int64 // 收到的查询总数
-	routeLocal  atomic.Int64 // 最终判定走境内（含 resolver 与兜底路径）
-	routeExtern atomic.Int64 // 最终判定走境外
-	routeAuto   atomic.Int64 // 交给 gohome resolver 双栈竞速
-	shadowed    atomic.Int64 // 被直连树遮蔽、强制绕行境外的 gfw 域名
-	fallback    atomic.Int64 // gohome resolver 不可用/失败，直查上游兜底
-	qtypeA      atomic.Int64
-	qtypeAAAA   atomic.Int64
-	qtypeOther  atomic.Int64
-	hostsHits   atomic.Int64 // 命中静态 hosts 规则的查询数
-	upAttempts  atomic.Int64 // 上游尝试次数（含 failover 重试）
-	upErrors    atomic.Int64 // 上游单次尝试失败次数
+	total        atomic.Int64 // 收到的查询总数
+	routeLocal   atomic.Int64 // 最终判定走境内（含 resolver 与兜底路径）
+	routeExtern  atomic.Int64 // 最终判定走境外
+	routeAuto    atomic.Int64 // 交给 gohome resolver 双栈竞速
+	shadowed     atomic.Int64 // 被直连树遮蔽、强制绕行境外的 gfw 域名
+	fallback     atomic.Int64 // gohome resolver 不可用/失败，直查上游兜底
+	qtypeA       atomic.Int64
+	qtypeAAAA    atomic.Int64
+	qtypeOther   atomic.Int64
+	hostsHits    atomic.Int64 // 命中静态 hosts 规则的查询数
+	upAttempts   atomic.Int64 // 上游尝试次数（含 failover 重试）
+	upErrors     atomic.Int64 // 上游单次尝试失败次数
+	cacheFlushes atomic.Int64 // 通过 POST /cache/flush 主动清缓存的次数
 }
 
 var metrics = &statsCounters{}
+
+// cacheStatus 由 main 注入，返回 resolver 当前响应缓存条目数；未注入时按 0 输出。
+var cacheStatus func() int
 
 func (s *statsCounters) reset() {
 	*s = statsCounters{}
@@ -97,6 +101,10 @@ type statsSnapshot struct {
 		Attempts int64 `json:"attempts"`
 		Errors   int64 `json:"errors"`
 	} `json:"upstreams"`
+	Cache struct {
+		Entries int   `json:"entries"` // resolver 响应缓存当前条目（含未懒清理的过期项）
+		Flushes int64 `json:"flushes"` // 主动 flush 次数
+	} `json:"cache"`
 	Qtypes struct {
 		A     int64 `json:"A"`
 		AAAA  int64 `json:"AAAA"`
@@ -123,6 +131,10 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Queries.Hosts = s.hostsHits.Load()
 	snap.Upstreams.Attempts = s.upAttempts.Load()
 	snap.Upstreams.Errors = s.upErrors.Load()
+	if cacheStatus != nil {
+		snap.Cache.Entries = cacheStatus()
+	}
+	snap.Cache.Flushes = s.cacheFlushes.Load()
 	snap.Qtypes.A = s.qtypeA.Load()
 	snap.Qtypes.AAAA = s.qtypeAAAA.Load()
 	snap.Qtypes.Other = s.qtypeOther.Load()
@@ -181,6 +193,11 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	writeHelp("yellowdns_upstream_errors_total", "counter", "Failed upstream exchange attempts.")
 	fmt.Fprintf(&b, "yellowdns_upstream_errors_total %d\n", snap.Upstreams.Errors)
 
+	writeHelp("yellowdns_cache_entries", "gauge", "DNS response cache entries currently held by the resolver.")
+	fmt.Fprintf(&b, "yellowdns_cache_entries %d\n", snap.Cache.Entries)
+	writeHelp("yellowdns_cache_flushes_total", "counter", "Explicit cache flushes triggered via POST /cache/flush.")
+	fmt.Fprintf(&b, "yellowdns_cache_flushes_total %d\n", snap.Cache.Flushes)
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	if _, err := w.Write([]byte(b.String())); err != nil {
 		loggo.Warn("write metrics fail: %v", err)
@@ -232,6 +249,30 @@ func (s *statsServer) statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// cacheFlushHandler 主动清空 resolver 响应缓存。写操作，鉴权与 /stats 一致，
+// 且只接受 POST；返回清空前的条目数。
+func (s *statsServer) cacheFlushHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="yellowdns-stats"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	n := 0
+	if s.flushCache != nil {
+		n = s.flushCache()
+	}
+	metrics.cacheFlushes.Add(1)
+	loggo.Info("cache flushed %d entries via http", n)
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]int{"cleared_entries": n}); err != nil {
+		loggo.Warn("write flush result fail: %v", err)
+	}
+}
+
 // authorized 校验 Bearer token；未配置 token 时不做限制（默认仅建议绑回环）。
 // 比较走常量时间，避免计时侧信道。
 func (s *statsServer) authorized(r *http.Request) bool {
@@ -248,8 +289,9 @@ func (s *statsServer) authorized(r *http.Request) bool {
 
 // statsServer 是可选的统计 HTTP 服务，-stats 指定监听地址时启用。
 type statsServer struct {
-	srv   *http.Server
-	token string
+	srv        *http.Server
+	token      string
+	flushCache func() int // resolver 就绪后由 main 注入
 }
 
 func startStatsServer(addr, token string) *statsServer {
@@ -264,6 +306,7 @@ func startStatsServer(addr, token string) *statsServer {
 	}
 	mux.HandleFunc("/stats", s.statsHandler)
 	mux.HandleFunc("/metrics", s.metricsHandler)
+	mux.HandleFunc("/cache/flush", s.cacheFlushHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/healthz", healthzHandler)
 	go func() {
