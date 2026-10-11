@@ -160,6 +160,9 @@ type routingResolver struct {
 	// ecs 为可选的 EDNS Client Subnet 策略（固定附加/剥离）；
 	// nil 表示不干预，客户端自带 ECS 随上游请求原样转发。
 	ecs *ecsPolicy
+
+	// policy 为可选的客户端访问控制/限速策略；nil 表示全部放行。
+	policy *clientPolicy
 }
 
 func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
@@ -179,6 +182,19 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	}
 	q := req.Question[0]
 	metrics.observeQuery(q.Qtype)
+
+	// 客户端访问控制/限速先于一切解析动作：被拒的请求既不命中 hosts/缓存，
+	// 也不会消耗任何上游资源。统一回 REFUSED（而非静默丢包），便于客户端
+	// 立即故障转移，也让拒绝在查询日志/响应码统计中可见。
+	if reason := r.policy.check(clientAddrFromContext(ctx)); reason != aclReasonAllow {
+		routeLabel = routeDenyLabel
+		metrics.observeACLReject(reason)
+		loggo.Info("client denied by %s: %s (%s %s)", reason,
+			clientAddrFromContext(ctx), dns.TypeToString[q.Qtype], q.Name)
+		reply := new(dns.Msg)
+		reply.SetRcode(req, dns.RcodeRefused)
+		return reply, nil
+	}
 
 	// 静态 hosts 规则优先级最高，命中即合成应答，不查任何上游。
 	if hit, ok := hostsAnswer(req); ok {
@@ -411,6 +427,12 @@ func main() {
 	queryLogMaxFiles := flag.Int("query-log-max-files", 5, "number of rotated query log files to keep (query.log.1 .. query.log.N)")
 	ecsCIDR := flag.String("ecs", "", "EDNS Client Subnet CIDR to add/override on upstream A/AAAA queries (e.g. -ecs 1.2.3.0/24), so CDN-savvy upstreams answer for that region; empty leaves client ECS untouched")
 	ecsStrip := flag.Bool("ecs-strip", false, "remove any EDNS Client Subnet option before forwarding to upstreams (privacy mode); mutually exclusive with -ecs")
+	allowCIDR := flag.String("allow", "", "comma-separated client CIDRs/IPs allowed to query (whitelist mode); empty allows everyone except -deny entries, e.g. -allow 10.0.0.0/8,192.168.1.5")
+	denyCIDR := flag.String("deny", "", "comma-separated client CIDRs/IPs refused service; deny always wins over allow")
+	allowFile := flag.String("allow-file", "", "file of allowed client CIDRs/IPs (one per line, '#' comments); reloaded on SIGHUP")
+	denyFile := flag.String("deny-file", "", "file of denied client CIDRs/IPs (one per line, '#' comments); reloaded on SIGHUP")
+	rateLimit := flag.Float64("rate-limit", 0, "per-client sustained query rate limit in QPS (e.g. 100); 0 disables. New clients start with a full burst bucket")
+	rateBurst := flag.Int("rate-burst", 0, "per-client burst capacity in queries; 0 defaults to twice -rate-limit (minimum 1)")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	pprofEnabled := flag.Bool("pprof", false, "expose Go pprof profilers at /debug/pprof/ on the -stats HTTP server (same bearer token as /stats); do not enable without a token on a non-loopback address")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
@@ -466,6 +488,18 @@ func main() {
 		return
 	}
 	if err := validateTLSConfig(*tlsListen, *tlsCert, *tlsKey); err != nil {
+		loggo.Error("%v", err)
+		return
+	}
+	var allowFiles, denyFiles []string
+	if *allowFile != "" {
+		allowFiles = []string{*allowFile}
+	}
+	if *denyFile != "" {
+		denyFiles = []string{*denyFile}
+	}
+	clientPolicyRule, err := newClientPolicy(*allowCIDR, *denyCIDR, allowFiles, denyFiles, *rateLimit, *rateBurst)
+	if err != nil {
 		loggo.Error("%v", err)
 		return
 	}
@@ -595,6 +629,7 @@ func main() {
 		maxTTL:   *cacheMaxTTL,
 		qlog:     qlog,
 		ecs:      ecsPolicy,
+		policy:   clientPolicyRule,
 	}
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
 	cacheStats = rr.cacheStats
@@ -614,6 +649,15 @@ func main() {
 	if ecsPolicy != nil {
 		ecsModeLabel.Store(ecsPolicy.ecsLabel())
 		loggo.Info("EDNS client subnet policy: %s", ecsPolicy.ecsLabel())
+	}
+	aclAllowN, aclDenyN := clientPolicyRule.entryCounts()
+	if aclAllowN > 0 || aclDenyN > 0 || *rateLimit > 0 {
+		aclStatusInfo = func() (int, int, float64, float64, int) {
+			a, d := clientPolicyRule.entryCounts()
+			return a, d, *rateLimit, float64(clientPolicyRule.limiterBurst()), clientPolicyRule.rateClients()
+		}
+		loggo.Info("client access control: allow %d entries, deny %d entries, per-client rate %v qps (burst %d)",
+			aclAllowN, aclDenyN, *rateLimit, clientPolicyRule.limiterBurst())
 	}
 	if stats != nil {
 		stats.flushCache = rr.flushCache
@@ -709,6 +753,16 @@ func main() {
 					loggo.Warn("tls cert reload fail: %v", err)
 				} else {
 					loggo.Info("tls cert reloaded")
+				}
+			}
+			// ACL 规则文件同样独立热重载，坏文件保留旧规则；
+			// 未配置 -allow-file/-deny-file 时为空操作。
+			if len(allowFiles)+len(denyFiles) > 0 {
+				if err := clientPolicyRule.reloadFiles(); err != nil {
+					loggo.Warn("client acl reload fail: %v", err)
+				} else {
+					a, d := clientPolicyRule.entryCounts()
+					loggo.Info("client acl reloaded allow %d deny %d", a, d)
 				}
 			}
 		},

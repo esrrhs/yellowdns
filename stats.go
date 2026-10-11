@@ -44,6 +44,8 @@ type statsCounters struct {
 	cacheFlushes atomic.Int64 // 通过 POST /cache/flush 主动清缓存的次数
 	staleServed  atomic.Int64 // 上游全失败后由 serve-stale 备份应答的查询数
 	ecsApplied   atomic.Int64 // 发往上游前被 ECS 策略改写（附加/覆盖/剥离）的 A/AAAA 查询数
+	aclDenied    atomic.Int64 // 命中 allow/deny 访问控制被 REFUSED 的查询数
+	rateLimited  atomic.Int64 // 超过每客户端 QPS 被 REFUSED 的查询数
 
 	// 应答结果维度：Exchange 返回错误（或无应答）计 qErrors；
 	// 有应答时按 Rcode 归类，并统计 TC 截断（UDP 超限需走 TCP 的信号）。
@@ -74,6 +76,10 @@ var queryLogStatus func() (enabled bool, written, dropped int64)
 // dotStatus 由 main 注入，返回 DoT 监听器是否启用；未注入按禁用输出。
 var dotStatus func() bool
 
+// aclStatusInfo 由 main 注入，返回当前访问控制规则条数、每客户端限速
+// QPS/突发容量与活动限速桶数；未注入时各项按 0 输出（表示全放行、不限速）。
+var aclStatusInfo func() (allowEntries, denyEntries int, rateQPS, burst float64, clients int)
+
 // ecsModeLabel 保存当前 ECS 策略的文本标签（off / cidr:x.x.x.x/xx / strip），
 // 启动时写入一次；进程内不变。
 var ecsModeLabel = func() *atomic.Value {
@@ -101,6 +107,16 @@ func (s *statsCounters) observeQuery(qtype uint16) {
 		s.qtypeAAAA.Add(1)
 	default:
 		s.qtypeOther.Add(1)
+	}
+}
+
+// observeACLReject 按拒绝原因累计访问控制/限速拒绝次数。
+func (s *statsCounters) observeACLReject(reason string) {
+	switch reason {
+	case aclReasonRateLimit:
+		s.rateLimited.Add(1)
+	default:
+		s.aclDenied.Add(1)
 	}
 }
 
@@ -156,6 +172,7 @@ const (
 	routeLocalLabel  = "local"
 	routeExternLabel = "extern"
 	routeAutoLabel   = "auto"
+	routeDenyLabel   = "deny"
 )
 
 func routeLabelOf(mode int) string {
@@ -235,7 +252,7 @@ type routeLatencySet struct {
 }
 
 func newRouteLatencySet() *routeLatencySet {
-	order := []string{routeHostsLabel, routeLocalLabel, routeExternLabel, routeAutoLabel}
+	order := []string{routeHostsLabel, routeLocalLabel, routeExternLabel, routeAutoLabel, routeDenyLabel}
 	m := make(map[string]*latencyHistogram, len(order))
 	for _, r := range order {
 		m[r] = &latencyHistogram{}
@@ -491,6 +508,15 @@ type statsSnapshot struct {
 	DOT struct {
 		Enabled bool `json:"enabled"` // 是否启用 DNS-over-TLS 入站监听（-tls）
 	} `json:"dot"`
+	ACL struct {
+		AllowEntries  int     `json:"allow_entries"`    // allow 规则条数；>0 表示白名单模式
+		DenyEntries   int     `json:"deny_entries"`     // deny 规则条数
+		RateLimitQPS  float64 `json:"rate_limit_qps"`   // 每客户端稳态 QPS；0 表示不限速
+		RateBurst     float64 `json:"rate_burst"`       // 每客户端突发容量
+		ActiveClients int     `json:"active_clients"`   // 当前有限速桶的客户端数（近似活动数）
+		DeniedACL     int64   `json:"denied_acl"`       // 因 allow/deny 规则被拒累计
+		DeniedRate    int64   `json:"denied_ratelimit"` // 因超速被拒累计
+	} `json:"acl"`
 	Updates struct {
 		Enabled         bool                            `json:"enabled"`
 		IntervalSeconds int64                           `json:"interval_seconds"`
@@ -566,6 +592,12 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	if dotStatus != nil {
 		snap.DOT.Enabled = dotStatus()
 	}
+	if aclStatusInfo != nil {
+		snap.ACL.AllowEntries, snap.ACL.DenyEntries,
+			snap.ACL.RateLimitQPS, snap.ACL.RateBurst, snap.ACL.ActiveClients = aclStatusInfo()
+	}
+	snap.ACL.DeniedACL = s.aclDenied.Load()
+	snap.ACL.DeniedRate = s.rateLimited.Load()
 	chinaH, gfwH, geoH := updateMetrics.snapshot()
 	snap.Updates.Sources = map[string]updateSourceSnapshot{
 		"china": chinaH,
@@ -713,6 +745,19 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		dotVal = 1
 	}
 	fmt.Fprintf(&b, "yellowdns_dot_info %d\n", dotVal)
+
+	writeHelp("yellowdns_acl_entries", "gauge", "Number of configured client access-control CIDR entries by kind (allow/deny).")
+	fmt.Fprintf(&b, "yellowdns_acl_entries{kind=%q} %d\n", "allow", snap.ACL.AllowEntries)
+	fmt.Fprintf(&b, "yellowdns_acl_entries{kind=%q} %d\n", "deny", snap.ACL.DenyEntries)
+	writeHelp("yellowdns_acl_rate_limit_qps", "gauge", "Per-client sustained query rate limit in QPS; 0 disables rate limiting.")
+	fmt.Fprintf(&b, "yellowdns_acl_rate_limit_qps %g\n", snap.ACL.RateLimitQPS)
+	writeHelp("yellowdns_acl_rate_burst", "gauge", "Per-client token-bucket burst capacity.")
+	fmt.Fprintf(&b, "yellowdns_acl_rate_burst %g\n", snap.ACL.RateBurst)
+	writeHelp("yellowdns_acl_active_clients", "gauge", "Clients currently holding a rate-limit bucket (approximate active-client count).")
+	fmt.Fprintf(&b, "yellowdns_acl_active_clients %d\n", snap.ACL.ActiveClients)
+	writeHelp("yellowdns_acl_denied_total", "counter", "Queries refused by client access control; reason is acl (allow/deny CIDR) or ratelimit.")
+	fmt.Fprintf(&b, "yellowdns_acl_denied_total{reason=%q} %d\n", "acl", snap.ACL.DeniedACL)
+	fmt.Fprintf(&b, "yellowdns_acl_denied_total{reason=%q} %d\n", "ratelimit", snap.ACL.DeniedRate)
 
 	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
 	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")
