@@ -41,6 +41,7 @@ type statsCounters struct {
 	upAttempts   atomic.Int64 // 上游尝试次数（含 failover 重试）
 	upErrors     atomic.Int64 // 上游单次尝试失败次数
 	cacheFlushes atomic.Int64 // 通过 POST /cache/flush 主动清缓存的次数
+	staleServed  atomic.Int64 // 上游全失败后由 serve-stale 备份应答的查询数
 
 	// 应答结果维度：Exchange 返回错误（或无应答）计 qErrors；
 	// 有应答时按 Rcode 归类，并统计 TC 截断（UDP 超限需走 TCP 的信号）。
@@ -57,9 +58,12 @@ type statsCounters struct {
 
 var metrics = &statsCounters{}
 
-// cacheStats 由 main 注入，返回 resolver 响应缓存的当前条目数与累计命中/未命中次数；
+// cacheStats 由 main 注入，返回 resolver 响应缓存当前条目数与累计命中/未命中次数；
 // 未注入时全部按 0 输出。
 var cacheStats func() (entries int, hits, misses int64)
+
+// staleStats 由 main 注入，返回 serve-stale 备份存储当前条目数；未注入时按 0 输出。
+var staleStats func() int
 
 // updateStatusInfo 由 main 注入，返回自动更新是否启用与检查间隔；未注入时按禁用输出。
 var updateStatusInfo func() (enabled bool, interval time.Duration)
@@ -445,11 +449,13 @@ type statsSnapshot struct {
 		Servers  []upstreamServerSnapshot `json:"servers"`
 	} `json:"upstreams"`
 	Cache struct {
-		Entries  int     `json:"entries"`   // resolver 响应缓存当前条目（含未懒清理的过期项）
-		Hits     int64   `json:"hits"`      // 累计缓存命中
-		Misses   int64   `json:"misses"`    // 累计缓存未命中（含过期）
-		HitRatio float64 `json:"hit_ratio"` // hits/(hits+misses)，无查找时为 0
-		Flushes  int64   `json:"flushes"`   // 主动 flush 次数
+		Entries      int     `json:"entries"`       // resolver 响应缓存当前条目（含未懒清理的过期项）
+		Hits         int64   `json:"hits"`          // 累计缓存命中
+		Misses       int64   `json:"misses"`        // 累计缓存未命中（含过期）
+		HitRatio     float64 `json:"hit_ratio"`     // hits/(hits+misses)，无查找时为 0
+		Flushes      int64   `json:"flushes"`       // 主动 flush 次数
+		StaleEntries int64   `json:"stale_entries"` // serve-stale 备份当前条目
+		StaleServed  int64   `json:"stale_served"`  // 上游全失败时由备份应答的累计次数
 	} `json:"cache"`
 	Qtypes struct {
 		A     int64 `json:"A"`
@@ -510,6 +516,10 @@ func (s *statsCounters) snapshot() statsSnapshot {
 		}
 	}
 	snap.Cache.Flushes = s.cacheFlushes.Load()
+	snap.Cache.StaleServed = s.staleServed.Load()
+	if staleStats != nil {
+		snap.Cache.StaleEntries = int64(staleStats())
+	}
 	snap.Qtypes.A = s.qtypeA.Load()
 	snap.Qtypes.AAAA = s.qtypeAAAA.Load()
 	snap.Qtypes.Other = s.qtypeOther.Load()
@@ -643,6 +653,10 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_cache_misses_total %d\n", snap.Cache.Misses)
 	writeHelp("yellowdns_cache_flushes_total", "counter", "Explicit cache flushes triggered via POST /cache/flush.")
 	fmt.Fprintf(&b, "yellowdns_cache_flushes_total %d\n", snap.Cache.Flushes)
+	writeHelp("yellowdns_cache_stale_entries", "gauge", "Serve-stale backup entries currently held.")
+	fmt.Fprintf(&b, "yellowdns_cache_stale_entries %d\n", snap.Cache.StaleEntries)
+	writeHelp("yellowdns_cache_stale_served_total", "counter", "Answers served from the stale backup after all upstreams failed (includes entries still within their clamped TTL floor).")
+	fmt.Fprintf(&b, "yellowdns_cache_stale_served_total %d\n", snap.Cache.StaleServed)
 
 	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
 	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")
