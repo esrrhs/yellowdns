@@ -127,16 +127,19 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 		return nil, errors.New("empty dns question")
 	}
 	q := req.Question[0]
+	metrics.observeQuery(q.Qtype)
 
 	mode := classifyName(q.Name)
 	if mode == routeExtern && externShadowedHit(q.Name) {
 		loggo.Info("route %s %s", routeName(routeExtern), q.Name)
+		metrics.observeRoute(routeExtern, true)
 		return exchangeList(ctx, r.external, req, r.timeout)
 	}
 
 	if r.inner != nil {
 		resp, err := r.inner.Exchange(ctx, req)
 		if err == nil && resp != nil {
+			metrics.observeRoute(mode, false)
 			return resp, nil
 		}
 		loggo.Warn("gohome resolver Exchange fail %v, fallback to direct upstream", err)
@@ -147,6 +150,8 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 		list = r.external
 	}
 	loggo.Info("route %s %s", routeName(mode), q.Name)
+	metrics.fallback.Add(1)
+	metrics.observeRoute(mode, false)
 	return exchangeList(ctx, list, req, r.timeout)
 }
 
@@ -154,10 +159,12 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg,
 func exchangeList(ctx context.Context, list []exchangeClient, req *dns.Msg, timeout time.Duration) (*dns.Msg, error) {
 	var lastErr error
 	for _, u := range list {
+		metrics.upAttempts.Add(1)
 		resp, err := exchangeOne(ctx, u, req, timeout)
 		if err == nil && resp != nil {
 			return resp, nil
 		}
+		metrics.upErrors.Add(1)
 		lastErr = err
 	}
 	if lastErr == nil {
@@ -209,6 +216,7 @@ func main() {
 	gfwFile := flag.String("gfw", "", "extra blocked domain list")
 	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists at this interval (e.g. 24h); 0 disables")
 	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists")
+	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	loglevel := flag.String("loglevel", "info", "log level")
@@ -313,6 +321,11 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
+	var stats *statsServer
+	if *statsAddr != "" {
+		stats = startStatsServer(*statsAddr)
+	}
+
 	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
 		return rr.reload(chinaFiles, gfwFiles, *localregionfile)
 	}
@@ -350,6 +363,9 @@ func main() {
 		},
 		func() {
 			loggo.Info("stopping...")
+			if stats != nil {
+				stats.close()
+			}
 			_ = srv.Stop()
 			close(done)
 		},
