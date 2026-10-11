@@ -66,10 +66,11 @@ func TestUpdaterRunOnce(t *testing.T) {
 
 	var applied int
 	var lastChina, lastGfw []string
-	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
+	apply := func(chinaFiles, gfwFiles []string) (int, int, int, error) {
 		applied++
 		lastChina, lastGfw = chinaFiles, gfwFiles
-		return loadDomainLists(chinaFiles, gfwFiles)
+		cn, gfw, err := loadDomainLists(chinaFiles, gfwFiles)
+		return cn, gfw, 0, err
 	}
 	u := &updater{
 		chinaURL:   srv.URL + "/china",

@@ -150,8 +150,10 @@ func TestHostsExchangeAndReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if _, _, err := r.reload(nil, nil, []string{f.Name()}, ""); err != nil {
+	if _, _, hostsN, err := r.reload(nil, nil, []string{f.Name()}, ""); err != nil {
 		t.Fatal(err)
+	} else if hostsN != 2 {
+		t.Fatalf("hosts count = %d, want 2", hostsN)
 	}
 
 	if got := queryA(t, r, "static.local"); got != "10.60.0.66" {
@@ -168,7 +170,7 @@ func TestHostsExchangeAndReload(t *testing.T) {
 
 	// 坏 hosts 文件：reload 失败且 hosts 与域名快照都保留
 	beforeHosts := currentHosts()
-	if _, _, err := r.reload(nil, nil, []string{"/no/such/hosts"}, ""); err == nil {
+	if _, _, _, err := r.reload(nil, nil, []string{"/no/such/hosts"}, ""); err == nil {
 		t.Fatal("missing hosts file should fail reload")
 	}
 	if currentHosts() != beforeHosts {
