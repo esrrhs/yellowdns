@@ -1,0 +1,15 @@
+# 构建镜像只需要源码、vendor 与 GeoLite2-Country.mmdb；
+# 排除 git 元数据、本地二进制、运行时日志与更新落盘目录，缩小构建上下文，
+# 也避免本机旧产物混入镜像构建层。
+.git
+.github
+*.log
+*.stderr
+*.test
+*.out
+yellowdns
+yellowdns.exe
+pack/
+pack.zip
+dist/
+data/
