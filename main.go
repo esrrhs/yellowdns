@@ -12,6 +12,7 @@ import (
 
 	"github.com/esrrhs/gohome/common"
 	gohomedns "github.com/esrrhs/gohome/dns"
+	"github.com/esrrhs/gohome/dns/cache"
 	"github.com/esrrhs/gohome/dns/upstream"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/miekg/dns"
@@ -144,6 +145,14 @@ type routingResolver struct {
 	local    []exchangeClient
 	external []exchangeClient
 	timeout  time.Duration
+
+	// stale 是独立于 gohome 内置缓存的"最后一份好应答"备份；staleTTL 为 0
+	// （功能关闭）时不写入也不读取。minTTL/maxTTL 对上游应答做 TTL 收敛，
+	// 即使不启用 serve-stale 也生效。
+	stale    *staleStore
+	staleTTL time.Duration
+	minTTL   time.Duration
+	maxTTL   time.Duration
 }
 
 func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
@@ -175,14 +184,21 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	if mode == routeExtern && externShadowedHit(q.Name) {
 		loggo.Info("route %s %s", routeName(routeExtern), q.Name)
 		metrics.observeRoute(routeExtern, true)
-		return exchangeList(ctx, r.external, req, r.timeout)
+		resp, err = exchangeList(ctx, r.external, req, r.timeout)
+		if err == nil && resp != nil {
+			return r.rememberAnswer(req, resp), nil
+		}
+		if stale, ok := r.serveStale(req); ok {
+			return stale, nil
+		}
+		return nil, err
 	}
 
 	if r.inner != nil {
 		resp, err = r.inner.Exchange(ctx, req)
 		if err == nil && resp != nil {
 			metrics.observeRoute(mode, false)
-			return resp, nil
+			return r.rememberAnswer(req, resp), nil
 		}
 		loggo.Warn("gohome resolver Exchange fail %v, fallback to direct upstream", err)
 	}
@@ -194,7 +210,57 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	loggo.Info("route %s %s", routeName(mode), q.Name)
 	metrics.fallback.Add(1)
 	metrics.observeRoute(mode, false)
-	return exchangeList(ctx, list, req, r.timeout)
+	resp, err = exchangeList(ctx, list, req, r.timeout)
+	if err == nil && resp != nil {
+		return r.rememberAnswer(req, resp), nil
+	}
+	// 所有上游都失败：若最近成功解析过该名字，在允许窗口内返回旧应答，
+	// 让断网/上游抖动期间的业务至少拿到一个大概率仍可用的地址。
+	if stale, ok := r.serveStale(req); ok {
+		return stale, nil
+	}
+	return nil, err
+}
+
+// staleKey 与 gohome 内置缓存使用同一套 key 规则（小写、去尾点）。
+func staleKey(q dns.Question) string {
+	return cache.KeyForMsg(q.Name, q.Qtype, q.Qclass)
+}
+
+// rememberAnswer 对成功应答套用 min/max TTL 收敛，并登记到 serve-stale 备份。
+// 只备份带 Answer 的正向应答（与 gohome 内置缓存的落盘口径一致）；
+// NODATA/NXDOMAIN 等否定应答不备份。
+func (r *routingResolver) rememberAnswer(req *dns.Msg, resp *dns.Msg) *dns.Msg {
+	if resp == nil || len(resp.Answer) == 0 {
+		return resp
+	}
+	effective := clampResponseTTL(resp, r.minTTL, r.maxTTL)
+	if r.stale != nil && r.staleTTL > 0 && effective > 0 {
+		r.stale.put(staleKey(req.Question[0]), resp, time.Now().Add(effective))
+	}
+	return resp
+}
+
+// serveStale 在全部上游失败后尝试返回备份应答。新鲜期内的备份按剩余 TTL
+// 衰减返回；已过期但在 staleTTL 窗口内的备份以固定小 TTL 返回。
+func (r *routingResolver) serveStale(req *dns.Msg) (*dns.Msg, bool) {
+	if r.stale == nil || r.staleTTL <= 0 {
+		return nil, false
+	}
+	entry, expired, ok := r.stale.get(staleKey(req.Question[0]), r.staleTTL)
+	if !ok {
+		return nil, false
+	}
+	entry.Id = req.Id
+	entry.Question = req.Question
+	metrics.staleServed.Add(1)
+	q := req.Question[0]
+	if expired {
+		loggo.Warn("serve stale answer for %s type %d, all upstreams failed", q.Name, q.Qtype)
+	} else {
+		loggo.Info("serve backup answer for %s type %d while all upstreams are unavailable", q.Name, q.Qtype)
+	}
+	return entry, true
 }
 
 // exchangeList 依次尝试上游列表，任一成功即返回（failover）。
@@ -245,13 +311,26 @@ func (r *routingResolver) cacheStats() (int, int64, int64) {
 	return r.inner.CacheLen(), r.inner.CacheHits(), r.inner.CacheMisses()
 }
 
-// flushCache 清空 gohome 响应缓存，返回清空前的条目数（供运维确认效果）。
-func (r *routingResolver) flushCache() int {
-	if r.inner == nil {
+// staleLen 返回 serve-stale 备份条目数；功能未初始化时为 0。
+func (r *routingResolver) staleLen() int {
+	if r.stale == nil {
 		return 0
 	}
-	n := r.inner.CacheLen()
-	r.inner.ClearCache()
+	return r.stale.len()
+}
+
+// flushCache 清空 gohome 响应缓存与 serve-stale 备份，返回清空前的条目总数
+// （供运维确认效果）。
+func (r *routingResolver) flushCache() int {
+	n := 0
+	if r.inner != nil {
+		n = r.inner.CacheLen()
+		r.inner.ClearCache()
+	}
+	if r.stale != nil {
+		n += r.stale.len()
+		r.stale.clear()
+	}
 	return n
 }
 
@@ -280,6 +359,11 @@ func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoF
 		// 已缓存的应答不会重新经过分流判定，清掉以免旧路由残留到 TTL 到期。
 		r.inner.ClearCache()
 	}
+	// 备份应答同样不经过分流判定，规则变更后一并清空，避免把改名/换路由的
+	// 旧地址在故障窗口里重新发给客户端。
+	if r.stale != nil {
+		r.stale.clear()
+	}
 	return chinaN, gfwN, hostsN, nil
 }
 
@@ -298,6 +382,10 @@ func main() {
 	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists and GeoIP database at this interval (e.g. 24h); 0 disables")
 	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists and GeoIP database")
 	shutdownDelay := flag.Duration("shutdown-delay", 0, "delay between /readyz turning 503 and closing DNS listeners on SIGTERM/SIGINT, giving load balancers time to drain (e.g. 2s); 0 disables")
+	cacheSize := flag.Int("cache-size", 2000, "response cache capacity in entries (gohome cache and serve-stale backup share this limit)")
+	cacheMinTTL := flag.Duration("cache-min-ttl", 0, "floor TTL applied to every upstream answer before caching and replying (e.g. 60s); 0 disables")
+	cacheMaxTTL := flag.Duration("cache-max-ttl", 0, "ceiling TTL applied to every upstream answer before caching and replying (e.g. 24h); 0 disables")
+	serveStale := flag.Duration("serve-stale", 0, "when all upstreams fail, keep replying with the last good answer for this long past its TTL (e.g. 24h); stale replies carry a 5s TTL. 0 disables")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
@@ -333,6 +421,15 @@ func main() {
 	loggo.Info("start yellowdns %s", version)
 
 	timeoutD := time.Duration(*timeout) * time.Millisecond
+
+	if *cacheSize <= 0 {
+		loggo.Error("-cache-size must be positive, got %d", *cacheSize)
+		return
+	}
+	if *cacheMinTTL > 0 && *cacheMaxTTL > 0 && *cacheMinTTL > *cacheMaxTTL {
+		loggo.Error("-cache-min-ttl %v must not be greater than -cache-max-ttl %v", *cacheMinTTL, *cacheMaxTTL)
+		return
+	}
 
 	if *updateEvery > 0 {
 		if err := os.MkdirAll(*updateDir, 0o755); err != nil {
@@ -404,6 +501,7 @@ func main() {
 	cfg.DirectDomains = domainKeys(doms.china)
 	cfg.ProxyDomains = domainKeys(doms.gfw)
 	cfg.Timeout = timeoutD
+	cfg.CacheCapacity = *cacheSize
 
 	localUpstreams, err := buildUpstreams("local", *localserer, timeoutD)
 	if err != nil {
@@ -426,9 +524,20 @@ func main() {
 		local:    localUpstreams,
 		external: externalUpstreams,
 		timeout:  timeoutD,
+		stale:    newStaleStore(*cacheSize),
+		staleTTL: *serveStale,
+		minTTL:   *cacheMinTTL,
+		maxTTL:   *cacheMaxTTL,
 	}
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
 	cacheStats = rr.cacheStats
+	staleStats = rr.staleLen
+	if *serveStale > 0 {
+		loggo.Info("serve-stale enabled: last good answer kept for %v past expiry", *serveStale)
+	}
+	if *cacheMinTTL > 0 || *cacheMaxTTL > 0 {
+		loggo.Info("cache ttl clamp: min=%v max=%v", *cacheMinTTL, *cacheMaxTTL)
+	}
 	if stats != nil {
 		stats.flushCache = rr.flushCache
 	}
