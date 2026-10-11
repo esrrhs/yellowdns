@@ -42,6 +42,7 @@ type statsCounters struct {
 	upErrors     atomic.Int64 // 上游单次尝试失败次数
 	cacheFlushes atomic.Int64 // 通过 POST /cache/flush 主动清缓存的次数
 	staleServed  atomic.Int64 // 上游全失败后由 serve-stale 备份应答的查询数
+	ecsApplied   atomic.Int64 // 发往上游前被 ECS 策略改写（附加/覆盖/剥离）的 A/AAAA 查询数
 
 	// 应答结果维度：Exchange 返回错误（或无应答）计 qErrors；
 	// 有应答时按 Rcode 归类，并统计 TC 截断（UDP 超限需走 TCP 的信号）。
@@ -68,6 +69,14 @@ var staleStats func() int
 // queryLogStatus 由 main 注入，返回查询日志是否启用及累计写入/丢弃条数；
 // 未注入时按禁用输出。丢弃条数非 0 表示磁盘跟不上查询速率。
 var queryLogStatus func() (enabled bool, written, dropped int64)
+
+// ecsModeLabel 保存当前 ECS 策略的文本标签（off / cidr:x.x.x.x/xx / strip），
+// 启动时写入一次；进程内不变。
+var ecsModeLabel = func() *atomic.Value {
+	var v atomic.Value
+	v.Store("off")
+	return &v
+}()
 
 // updateStatusInfo 由 main 注入，返回自动更新是否启用与检查间隔；未注入时按禁用输出。
 var updateStatusInfo func() (enabled bool, interval time.Duration)
@@ -471,6 +480,10 @@ type statsSnapshot struct {
 		Written int64 `json:"written"` // 累计成功写入的查询日志行数
 		Dropped int64 `json:"dropped"` // 队列满被丢弃的日志数（磁盘跟不上的信号）
 	} `json:"query_log"`
+	ECS struct {
+		Mode    string `json:"mode"`    // off / cidr:<cidr> / strip
+		Applied int64  `json:"applied"` // 被策略改写的 A/AAAA 查询累计数
+	} `json:"ecs"`
 	Updates struct {
 		Enabled         bool                            `json:"enabled"`
 		IntervalSeconds int64                           `json:"interval_seconds"`
@@ -541,6 +554,8 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	if queryLogStatus != nil {
 		snap.QueryLog.Enabled, snap.QueryLog.Written, snap.QueryLog.Dropped = queryLogStatus()
 	}
+	snap.ECS.Mode, _ = ecsModeLabel.Load().(string)
+	snap.ECS.Applied = s.ecsApplied.Load()
 	chinaH, gfwH, geoH := updateMetrics.snapshot()
 	snap.Updates.Sources = map[string]updateSourceSnapshot{
 		"china": chinaH,
@@ -676,6 +691,11 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_querylog_written_total %d\n", snap.QueryLog.Written)
 	writeHelp("yellowdns_querylog_dropped_total", "counter", "Query log lines dropped because the async queue was full (disk cannot keep up).")
 	fmt.Fprintf(&b, "yellowdns_querylog_dropped_total %d\n", snap.QueryLog.Dropped)
+
+	writeHelp("yellowdns_ecs_info", "gauge", "Always 1; the mode label carries the EDNS Client Subnet policy (off, cidr:<cidr>, strip).")
+	fmt.Fprintf(&b, "yellowdns_ecs_info{mode=%q} 1\n", snap.ECS.Mode)
+	writeHelp("yellowdns_ecs_applied_total", "counter", "A/AAAA queries whose EDNS Client Subnet option was added, overridden or stripped before forwarding.")
+	fmt.Fprintf(&b, "yellowdns_ecs_applied_total %d\n", snap.ECS.Applied)
 
 	writeHelp("yellowdns_update_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last auto-update attempt per source; 0 means never attempted.")
 	writeHelp("yellowdns_update_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last reachable auto-update source (content unchanged counts as success); 0 means never succeeded.")

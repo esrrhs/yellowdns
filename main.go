@@ -156,6 +156,10 @@ type routingResolver struct {
 
 	// qlog 为可选的结构化查询日志；nil 表示关闭，recordQueryLog 直接跳过。
 	qlog *queryLogger
+
+	// ecs 为可选的 EDNS Client Subnet 策略（固定附加/剥离）；
+	// nil 表示不干预，客户端自带 ECS 随上游请求原样转发。
+	ecs *ecsPolicy
 }
 
 func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns.Msg, err error) {
@@ -182,6 +186,12 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 		routeLabel = routeHostsLabel
 		loggo.Info("route hosts %s", q.Name)
 		return hit, nil
+	}
+
+	// ECS 只影响发往上游的报文（gohome/绕行/兜底三条路径共用同一个 req），
+	// hosts 合成应答不需要；放在所有上游分支之前统一改写一次。
+	if applyECS(req, r.ecs) {
+		metrics.ecsApplied.Add(1)
 	}
 
 	mode := classifyName(q.Name)
@@ -396,6 +406,8 @@ func main() {
 	queryLogFile := flag.String("query-log", "", "write one JSON line per query to this file (e.g. query.log); '-' writes to stdout; empty disables. Rotated by size and reopened on SIGHUP")
 	queryLogMaxMB := flag.Int("query-log-max-mb", 100, "rotate the query log after it reaches this size in MiB; 0 disables size rotation")
 	queryLogMaxFiles := flag.Int("query-log-max-files", 5, "number of rotated query log files to keep (query.log.1 .. query.log.N)")
+	ecsCIDR := flag.String("ecs", "", "EDNS Client Subnet CIDR to add/override on upstream A/AAAA queries (e.g. -ecs 1.2.3.0/24), so CDN-savvy upstreams answer for that region; empty leaves client ECS untouched")
+	ecsStrip := flag.Bool("ecs-strip", false, "remove any EDNS Client Subnet option before forwarding to upstreams (privacy mode); mutually exclusive with -ecs")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
@@ -443,6 +455,14 @@ func main() {
 	if *queryLogMaxMB < 0 || *queryLogMaxFiles < 0 {
 		loggo.Error("-query-log-max-mb and -query-log-max-files must not be negative")
 		return
+	}
+	ecsPolicy, err := parseECSPolicy(*ecsCIDR, *ecsStrip)
+	if err != nil {
+		loggo.Error("%v", err)
+		return
+	}
+	if ecsPolicy != nil && ecsPolicy.isPrivateScope() {
+		loggo.Warn("-ecs %s is a private/local range: it leaks no real topology but gives upstreams no useful geo hint", ecsPolicy.net)
 	}
 
 	if *updateEvery > 0 {
@@ -560,6 +580,7 @@ func main() {
 		minTTL:   *cacheMinTTL,
 		maxTTL:   *cacheMaxTTL,
 		qlog:     qlog,
+		ecs:      ecsPolicy,
 	}
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
 	cacheStats = rr.cacheStats
@@ -575,6 +596,10 @@ func main() {
 	}
 	if *cacheMinTTL > 0 || *cacheMaxTTL > 0 {
 		loggo.Info("cache ttl clamp: min=%v max=%v", *cacheMinTTL, *cacheMaxTTL)
+	}
+	if ecsPolicy != nil {
+		ecsModeLabel.Store(ecsPolicy.ecsLabel())
+		loggo.Info("EDNS client subnet policy: %s", ecsPolicy.ecsLabel())
 	}
 	if stats != nil {
 		stats.flushCache = rr.flushCache
