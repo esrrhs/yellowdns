@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -844,17 +845,22 @@ func (s *statsServer) updateRefreshHandler(w http.ResponseWriter, r *http.Reques
 }
 
 // authorized 校验 Bearer token；未配置 token 时不做限制（默认仅建议绑回环）。
-// 比较走常量时间，避免计时侧信道。
 func (s *statsServer) authorized(r *http.Request) bool {
 	if s.token == "" {
 		return true
 	}
+	return bearerAuthorized(s.token, r)
+}
+
+// bearerAuthorized 常量时间比较 Authorization 头中的 Bearer token，
+// 避免计时侧信道；供 /stats 系列端点与 pprof 共用。
+func bearerAuthorized(token string, r *http.Request) bool {
 	h := r.Header.Get("Authorization")
 	const scheme = "Bearer "
 	if len(h) <= len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(h[len(scheme):]), []byte(s.token)) == 1
+	return subtle.ConstantTimeCompare([]byte(h[len(scheme):]), []byte(token)) == 1
 }
 
 // statsServer 是可选的统计 HTTP 服务，-stats 指定监听地址时启用。
@@ -866,22 +872,15 @@ type statsServer struct {
 	triggerUpdate func(ctx context.Context) (updateResult, error)
 }
 
-func startStatsServer(addr, token string) *statsServer {
-	mux := http.NewServeMux()
+func startStatsServer(addr, token string, pprofEnabled bool) *statsServer {
 	s := &statsServer{
 		token: token,
 		srv: &http.Server{
 			Addr:              addr,
-			Handler:           mux,
+			Handler:           newStatsMux(token, pprofEnabled),
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}
-	mux.HandleFunc("/stats", s.statsHandler)
-	mux.HandleFunc("/metrics", s.metricsHandler)
-	mux.HandleFunc("/cache/flush", s.cacheFlushHandler)
-	mux.HandleFunc("/update/refresh", s.updateRefreshHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/healthz", healthzHandler)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			loggo.Error("stats server fail: %v", err)
@@ -892,7 +891,48 @@ func startStatsServer(addr, token string) *statsServer {
 	} else {
 		loggo.Info("stats endpoint on http://%s/stats (bearer token required)", addr)
 	}
+	if pprofEnabled {
+		loggo.Info("pprof endpoint on http://%s/debug/pprof/", addr)
+	}
 	return s
+}
+
+// pprofGuard 给 profiling 端点包一层与 /stats 同口径的 Bearer 鉴权：
+// CPU/trace profile 既能被用来做低成本 DoS，又会泄露运行时细节，
+// 绝不能在无鉴权情况下对外暴露。
+func pprofGuard(token string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if token != "" && !bearerAuthorized(token, r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="yellowdns-stats"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// newStatsMux 组装统计/运维 HTTP 路由，独立成函数便于在不监听端口的情况下
+// 用 httptest 验证路由与鉴权。pprofEnabled 为 false 时不注册任何
+// /debug/pprof 路由，请求按 404 处理。
+func newStatsMux(token string, pprofEnabled bool) *http.ServeMux {
+	mux := http.NewServeMux()
+	s := &statsServer{token: token}
+	mux.HandleFunc("/stats", s.statsHandler)
+	mux.HandleFunc("/metrics", s.metricsHandler)
+	mux.HandleFunc("/cache/flush", s.cacheFlushHandler)
+	mux.HandleFunc("/update/refresh", s.updateRefreshHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/healthz", healthzHandler)
+	if pprofEnabled {
+		// net/http/pprof 的 init 只往 DefaultServeMux 注册；这里显式挂到
+		// 自己的 mux，"/debug/pprof/" 前缀匹配负责 index/goroutine/heap 等子页。
+		mux.HandleFunc("/debug/pprof/", pprofGuard(token, pprof.Index))
+		mux.HandleFunc("/debug/pprof/cmdline", pprofGuard(token, pprof.Cmdline))
+		mux.HandleFunc("/debug/pprof/profile", pprofGuard(token, pprof.Profile))
+		mux.HandleFunc("/debug/pprof/symbol", pprofGuard(token, pprof.Symbol))
+		mux.HandleFunc("/debug/pprof/trace", pprofGuard(token, pprof.Trace))
+	}
+	return mux
 }
 
 // isLoopbackAddr 粗略判断监听地址是否只绑回环，用于无 token 时告警。

@@ -30,6 +30,8 @@ docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp -p
 
 If port 53 is already taken by another interface, listen on `127.0.0.1:53` instead.
 
+The release image is based on `debian:bookworm-slim` with `ca-certificates` installed (required for the default DoH upstreams) and runs as a non-root user; `/app` is writable so `-update` can persist the downloaded lists and GeoIP database in the default working directory.
+
 # Flags
 
 * `-l`: listen address serving both UDP and TCP, default `:53`
@@ -55,7 +57,9 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
   * `POST /update/refresh` — trigger an immediate china/gfw/GeoIP refresh (serialized with the periodic check, hot-reloads on change) and return per-source results; POST-only, same bearer auth. `200` when at least one source is reachable (partial failures stay in the body), `502` when all three fail, `503` when `-update` is disabled
   * `GET /readyz` — unauthenticated readiness probe: `503 not ready` until the UDP+TCP listeners are up, `200 ready` afterwards (flips back to 503 during graceful shutdown). Intended for K8s readinessProbe / load-balancer drain; it exposes no data
   * `GET /healthz` — unauthenticated liveness probe returning `200 ok` (intended for Docker/K8s health checks; it exposes no data)
-* `-stats-token`: bearer token required to access `/stats`, `/metrics`, `POST /cache/flush` and `POST /update/refresh`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show up in `ps`). `/healthz` and `/readyz` stay unauthenticated. When unset the endpoints are open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
+  * `GET /debug/pprof/` — Go runtime profiler pages (`goroutine`, `heap`, `profile?seconds=N`, `trace?seconds=N`, ...), only registered with `-pprof`; same bearer auth as `/stats`. Point `go tool pprof http://127.0.0.1:8053/debug/pprof/profile?seconds=30` at it for a CPU profile
+* `-stats-token`: bearer token required to access `/stats`, `/metrics`, `POST /cache/flush`, `POST /update/refresh` and `/debug/pprof/`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show in `ps`). `/healthz` and `/readyz` stay unauthenticated. When unset the endpoints are open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
+* `-pprof`: enable the `net/http/pprof` profiler under `/debug/pprof/` on the `-stats` server for live CPU/heap/goroutine/trace debugging; default off. Starting with pprof on a non-loopback `-stats` address and no token is refused; `-pprof` without `-stats` logs a warning and has no effect
 * `-version`: show version and exit
 * other options: `./yellowdns -h`
 

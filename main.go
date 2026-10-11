@@ -409,6 +409,7 @@ func main() {
 	ecsCIDR := flag.String("ecs", "", "EDNS Client Subnet CIDR to add/override on upstream A/AAAA queries (e.g. -ecs 1.2.3.0/24), so CDN-savvy upstreams answer for that region; empty leaves client ECS untouched")
 	ecsStrip := flag.Bool("ecs-strip", false, "remove any EDNS Client Subnet option before forwarding to upstreams (privacy mode); mutually exclusive with -ecs")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
+	pprofEnabled := flag.Bool("pprof", false, "expose Go pprof profilers at /debug/pprof/ on the -stats HTTP server (same bearer token as /stats); do not enable without a token on a non-loopback address")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
@@ -484,7 +485,13 @@ func main() {
 		if token == "" && !isLoopbackAddr(*statsAddr) {
 			loggo.Warn("stats endpoint on %s has no token and is not loopback-only; set -stats-token or YELLOWDNS_STATS_TOKEN", *statsAddr)
 		}
-		stats = startStatsServer(*statsAddr, token)
+		if *pprofEnabled && token == "" && !isLoopbackAddr(*statsAddr) {
+			loggo.Error("refusing to expose /debug/pprof/ on non-loopback %s without a token; set -stats-token or YELLOWDNS_STATS_TOKEN, or bind 127.0.0.1", *statsAddr)
+			return
+		}
+		stats = startStatsServer(*statsAddr, token, *pprofEnabled)
+	} else if *pprofEnabled {
+		loggo.Warn("-pprof has no effect without -stats; /debug/pprof/ is served by the stats HTTP server")
 	}
 
 	// 远端列表/GeoIP 库（若已存在）+ 用户附加文件，二者都合并进内置集合。
