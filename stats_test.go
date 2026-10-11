@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,88 @@ func TestIsLoopbackAddr(t *testing.T) {
 		if got := isLoopbackAddr(addr); got != want {
 			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
 		}
+	}
+}
+
+func TestMetricsHandler(t *testing.T) {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+	metrics.total.Add(11)
+	metrics.routeLocal.Add(5)
+	metrics.hostsHits.Add(2)
+	metrics.upAttempts.Add(8)
+	metrics.upErrors.Add(3)
+	metrics.qtypeOther.Add(1)
+
+	s := &statsServer{}
+	rec := httptest.NewRecorder()
+	s.metricsHandler(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Fatalf("content-type = %q", ct)
+	}
+	for _, want := range []string{
+		"# TYPE yellowdns_queries_total counter",
+		`yellowdns_queries_total{route="local"} 5`,
+		"yellowdns_queries_hosts_total 2",
+		"yellowdns_queries_total_all 11",
+		"yellowdns_upstream_attempts_total 8",
+		"yellowdns_upstream_errors_total 3",
+		`yellowdns_queries_qtype_total{type="other"} 1`,
+		"# TYPE yellowdns_domains gauge",
+		"# TYPE yellowdns_uptime_seconds gauge",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q\n%s", want, body)
+		}
+	}
+
+	// 鉴权与 /stats 相同
+	protected := &statsServer{token: "tk"}
+	rec2 := httptest.NewRecorder()
+	protected.metricsHandler(rec2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", rec2.Code)
+	}
+	rec3 := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	req.Header.Set("Authorization", "Bearer tk")
+	protected.metricsHandler(rec3, req)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("with token status = %d, want 200", rec3.Code)
+	}
+
+	// POST 拒绝
+	rec4 := httptest.NewRecorder()
+	s.metricsHandler(rec4, httptest.NewRequest(http.MethodPost, "/metrics", nil))
+	if rec4.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want 405", rec4.Code)
+	}
+}
+
+func TestHealthzHandler(t *testing.T) {
+	// 健康探针不鉴权，即使配置了 token
+	protected := &statsServer{token: "tk"}
+	rec := httptest.NewRecorder()
+	protected.statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("sanity: /stats should be 401, got %d", rec.Code)
+	}
+	hrec := httptest.NewRecorder()
+	healthzHandler(hrec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if hrec.Code != http.StatusOK || strings.TrimSpace(hrec.Body.String()) != "ok" {
+		t.Fatalf("healthz = %d %q", hrec.Code, hrec.Body.String())
+	}
+	hrec2 := httptest.NewRecorder()
+	healthzHandler(hrec2, httptest.NewRequest(http.MethodPost, "/healthz", nil))
+	if hrec2.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST healthz = %d, want 405", hrec2.Code)
 	}
 }
 
