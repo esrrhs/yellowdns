@@ -247,8 +247,9 @@ func main() {
 	chinaFile := flag.String("china", "", "extra china domain list")
 	gfwFile := flag.String("gfw", "", "extra blocked domain list")
 	hostsFile := flag.String("hosts", "", "static hosts file (standard hosts format or dnsmasq address=/name/ip lines)")
-	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists at this interval (e.g. 24h); 0 disables")
-	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists")
+	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists and GeoIP database at this interval (e.g. 24h); 0 disables")
+	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists and GeoIP database")
+	shutdownDelay := flag.Duration("shutdown-delay", 0, "delay between /readyz turning 503 and closing DNS listeners on SIGTERM/SIGINT, giving load balancers time to drain (e.g. 2s); 0 disables")
 	statsAddr := flag.String("stats", "", "HTTP listen addr for /stats JSON (e.g. 127.0.0.1:8053); empty disables")
 	statsToken := flag.String("stats-token", "", "bearer token required for /stats; defaults to YELLOWDNS_STATS_TOKEN env. Prefer the env var so the token is not visible via ps")
 	nolog := flag.Int("nolog", 0, "write log file")
@@ -307,12 +308,19 @@ func main() {
 		stats = startStatsServer(*statsAddr, token)
 	}
 
-	// 远端列表（若已存在）+ 用户附加文件，二者都合并进内置集合。
+	// 远端列表/GeoIP 库（若已存在）+ 用户附加文件，二者都合并进内置集合。
 	remoteChinaPath := filepath.Join(*updateDir, remoteChinaFile)
 	remoteGfwPath := filepath.Join(*updateDir, remoteGfwFile)
+	remoteGeoPath := filepath.Join(*updateDir, remoteGeoFile)
 	userChinaFiles := []string{*chinaFile}
 	userGfwFiles := []string{*gfwFile}
 	userHostsFiles := []string{*hostsFile}
+	// 已落盘的远端 GeoIP 库优先于 -lof 内置库；不存在时回退内置库。
+	geoFile := *localregionfile
+	if p := remoteIfExist(remoteGeoPath); len(p) > 0 {
+		geoFile = p[0]
+		loggo.Info("using downloaded geoip database %s", geoFile)
+	}
 
 	hostsN, err := loadHosts(userHostsFiles)
 	if err != nil {
@@ -343,7 +351,7 @@ func main() {
 	cfg.EnableFakeIP = false
 	cfg.DirectUpstreams = localAddrs
 	cfg.RemoteUpstreams = externalAddrs
-	cfg.GeoIPFile = *localregionfile
+	cfg.GeoIPFile = geoFile
 	cfg.RegionCode = *localregion
 	cfg.DirectDomains = domainKeys(doms.china)
 	cfg.ProxyDomains = domainKeys(doms.gfw)
@@ -384,19 +392,28 @@ func main() {
 	}
 	loggo.Info("listening on %s (udp+tcp)", srv.Addr())
 
-	apply := func(chinaFiles, gfwFiles []string) (int, int, int, error) {
-		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, *localregionfile)
+	// currentGeoFile 在每次重载时重新选择：自动更新落盘新库后，HUP/更新触发的
+	// 重载都应立即切到远端库；远端库被移除时回退 -lof 内置库。
+	currentGeoFile := func() string {
+		if p := remoteIfExist(remoteGeoPath); len(p) > 0 {
+			return p[0]
+		}
+		return *localregionfile
+	}
+	apply := func(chinaFiles, gfwFiles []string, gf string) (int, int, int, error) {
+		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, gf)
 	}
 
 	if *updateEvery > 0 {
 		u := &updater{
-			chinaURL:   defaultChinaListURL,
-			gfwURL:     defaultGFWListURL,
-			dir:        *updateDir,
-			interval:   *updateEvery,
-			apply:      apply,
-			extraChina: userChinaFiles,
-			extraGfw:   userGfwFiles,
+			chinaURL:     defaultChinaListURL,
+			gfwURL:       defaultGFWListURL,
+			dir:          *updateDir,
+			interval:     *updateEvery,
+			apply:        apply,
+			localGeoFile: *localregionfile,
+			extraChina:   userChinaFiles,
+			extraGfw:     userGfwFiles,
 		}
 		go u.run()
 		loggo.Info("auto update enabled, interval %v, dir %s", *updateEvery, *updateDir)
@@ -406,12 +423,13 @@ func main() {
 	ready.Store(true)
 
 	done := make(chan struct{})
-	// HUP 重载的范围与启动一致：已落盘的远端列表 + 用户附加文件，
+	// HUP 重载的范围与启动一致：已落盘的远端列表/GeoIP 库 + 用户附加文件，
 	// 否则 HUP 会把自动更新已生效的规则悄悄回退。
 	reloadAll := func() (int, int, int, error) {
 		return apply(
 			append(remoteIfExist(remoteChinaPath), userChinaFiles...),
-			append(remoteIfExist(remoteGfwPath), userGfwFiles...))
+			append(remoteIfExist(remoteGfwPath), userGfwFiles...),
+			currentGeoFile())
 	}
 	setupSignalHandler(
 		func() {
@@ -424,12 +442,17 @@ func main() {
 		},
 		func() {
 			loggo.Info("stopping...")
-			// 先摘就绪再关监听，给负载均衡一个剔除实例的窗口。
+			// 先摘就绪，探针 HTTP 服务在延迟窗口内继续返回 503，DNS 继续处理存量请求，
+			// 给负载均衡一个观察到未就绪并摘除实例的窗口，然后再关监听。
 			ready.Store(false)
+			if *shutdownDelay > 0 {
+				loggo.Info("draining for %v before closing listeners", *shutdownDelay)
+				time.Sleep(*shutdownDelay)
+			}
+			_ = srv.Stop()
 			if stats != nil {
 				stats.close()
 			}
-			_ = srv.Stop()
 			close(done)
 		},
 	)

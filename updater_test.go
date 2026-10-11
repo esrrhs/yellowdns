@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -41,6 +42,11 @@ func TestUpdaterRunOnce(t *testing.T) {
 
 	var chinaBody, gfwBody []byte
 	chinaStatus := http.StatusOK
+	mmdbBytes, err := os.ReadFile("GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mmdbGz := gzipBytes(t, mmdbBytes)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/china", func(w http.ResponseWriter, r *http.Request) {
 		if chinaStatus != http.StatusOK {
@@ -51,6 +57,9 @@ func TestUpdaterRunOnce(t *testing.T) {
 	})
 	mux.HandleFunc("/gfw", func(w http.ResponseWriter, r *http.Request) {
 		w.Write(gfwBody)
+	})
+	mux.HandleFunc("/geo", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(mmdbGz)
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
@@ -66,20 +75,23 @@ func TestUpdaterRunOnce(t *testing.T) {
 
 	var applied int
 	var lastChina, lastGfw []string
-	apply := func(chinaFiles, gfwFiles []string) (int, int, int, error) {
+	var lastGeo string
+	apply := func(chinaFiles, gfwFiles []string, geoFile string) (int, int, int, error) {
 		applied++
-		lastChina, lastGfw = chinaFiles, gfwFiles
+		lastChina, lastGfw, lastGeo = chinaFiles, gfwFiles, geoFile
 		cn, gfw, err := loadDomainLists(chinaFiles, gfwFiles)
 		return cn, gfw, 0, err
 	}
 	u := &updater{
-		chinaURL:   srv.URL + "/china",
-		gfwURL:     srv.URL + "/gfw",
-		dir:        dir,
-		interval:   time.Hour,
-		apply:      apply,
-		extraChina: []string{userChina},
-		client:     srv.Client(),
+		chinaURL:     srv.URL + "/china",
+		gfwURL:       srv.URL + "/gfw",
+		geoURLs:      []string{srv.URL + "/geo"},
+		dir:          dir,
+		interval:     time.Hour,
+		apply:        apply,
+		localGeoFile: "builtin.mmdb",
+		extraChina:   []string{userChina},
+		client:       srv.Client(),
 	}
 
 	// 首次更新：下载、落盘、重载
@@ -110,6 +122,14 @@ func TestUpdaterRunOnce(t *testing.T) {
 	if len(lastGfw) != 1 || lastGfw[0] != filepath.Join(dir, remoteGfwFile) {
 		t.Errorf("apply gfwFiles = %v, want only remote file", lastGfw)
 	}
+	// 远端 GeoIP 库下载落盘后，apply 使用它而非内置库
+	if lastGeo != filepath.Join(dir, remoteGeoFile) {
+		t.Errorf("apply geoFile = %q, want downloaded %s", lastGeo, remoteGeoFile)
+	}
+	geoDisk, err := os.ReadFile(filepath.Join(dir, remoteGeoFile))
+	if err != nil || !bytes.Equal(geoDisk, mmdbBytes) {
+		t.Fatalf("geoip remote file mismatch: %v", err)
+	}
 
 	// 内容未变：跳过重载
 	u.runOnce()
@@ -138,6 +158,166 @@ func TestUpdaterRunOnce(t *testing.T) {
 		t.Fatalf("failed download must not replace old file: %v", err)
 	}
 	if got := classifyName("d0.update-gfw.test."); got != routeExtern {
-		t.Errorf("old gfw rule lost after failed download, got %s", routeName(got))
+		t.Errorf("old gfw rule lost after failed update, got %s", routeName(got))
 	}
+}
+
+func gzipBytes(t testing.TB, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestGeoCandidates(t *testing.T) {
+	// 普通月份：当月优先，上月回退
+	got := geoCandidates(time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC))
+	want := []string{
+		"https://download.db-ip.com/free/dbip-country-lite-2026-10.mmdb.gz",
+		"https://download.db-ip.com/free/dbip-country-lite-2026-09.mmdb.gz",
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("geoCandidates = %v, want %v", got, want)
+	}
+	// 1 月的上月要正确翻到上一年的 12 月
+	jan := geoCandidates(time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC))
+	if jan[1] != "https://download.db-ip.com/free/dbip-country-lite-2026-12.mmdb.gz" {
+		t.Fatalf("january fallback = %q, want 2026-12", jan[1])
+	}
+}
+
+func TestValidateMMDB(t *testing.T) {
+	if err := validateMMDB([]byte("not an mmdb")); err == nil {
+		t.Fatal("garbage bytes must fail validation")
+	}
+	b, err := os.ReadFile("GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMMDB(b); err != nil {
+		t.Fatalf("real country mmdb must pass validation: %v", err)
+	}
+}
+
+// TestUpdateGeo 覆盖 GeoIP 更新主链路与各类失败回退。
+func TestUpdateGeo(t *testing.T) {
+	mmdbBytes, err := os.ReadFile("GeoLite2-Country.mmdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mmdbGz := gzipBytes(t, mmdbBytes)
+	badMmdbGz := gzipBytes(t, make([]byte, minGeoMMDBBytes+1024))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(mmdbGz)
+	})
+	mux.HandleFunc("/badgz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("this is not gzip"))
+	})
+	mux.HandleFunc("/badmmdb", func(w http.ResponseWriter, r *http.Request) {
+		// 超过 1MB 的零字节，绕过体积下限但不是合法 mmdb
+		w.Write(badMmdbGz)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	t.Run("download and unchanged", func(t *testing.T) {
+		dir := t.TempDir()
+		u := &updater{dir: dir, geoURLs: []string{srv.URL + "/ok"}, client: srv.Client()}
+
+		if u.activeGeoFile() != "" {
+			t.Fatal("activeGeoFile with no local fallback and no download should be empty")
+		}
+		u.localGeoFile = "builtin.mmdb"
+		if got := u.activeGeoFile(); got != "builtin.mmdb" {
+			t.Fatalf("before download activeGeoFile = %q, want builtin", got)
+		}
+
+		changed, err := u.updateGeo()
+		if err != nil || !changed {
+			t.Fatalf("first updateGeo changed=%v err=%v", changed, err)
+		}
+		dst := filepath.Join(dir, remoteGeoFile)
+		got, err := os.ReadFile(dst)
+		if err != nil || !bytes.Equal(got, mmdbBytes) {
+			t.Fatalf("downloaded mmdb mismatch: %v", err)
+		}
+		if got := u.activeGeoFile(); got != dst {
+			t.Fatalf("after download activeGeoFile = %q, want %s", got, dst)
+		}
+
+		// 内容一致：不重写
+		changed, err = u.updateGeo()
+		if err != nil || changed {
+			t.Fatalf("unchanged updateGeo changed=%v err=%v", changed, err)
+		}
+	})
+
+	t.Run("invalid gzip keeps old database", func(t *testing.T) {
+		dir := t.TempDir()
+		u := &updater{
+			dir:          dir,
+			geoURLs:      []string{srv.URL + "/ok"},
+			localGeoFile: "builtin.mmdb",
+			client:       srv.Client(),
+		}
+		// 先写入一份好库
+		if _, err := u.updateGeo(); err != nil {
+			t.Fatal(err)
+		}
+		old, err := os.ReadFile(filepath.Join(dir, remoteGeoFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 再喂坏 gzip：必须失败且旧库保留
+		u.geoURLs = []string{srv.URL + "/badgz"}
+		if _, err := u.updateGeo(); err == nil {
+			t.Fatal("invalid gzip must return error")
+		}
+		cur, err := os.ReadFile(filepath.Join(dir, remoteGeoFile))
+		if err != nil || !bytes.Equal(cur, old) {
+			t.Fatalf("old database must survive invalid gzip: %v", err)
+		}
+		if got := u.activeGeoFile(); got != filepath.Join(dir, remoteGeoFile) {
+			t.Fatalf("activeGeoFile = %q, want old remote db", got)
+		}
+	})
+
+	t.Run("invalid mmdb payload rejected", func(t *testing.T) {
+		dir := t.TempDir()
+		u := &updater{dir: dir, geoURLs: []string{srv.URL + "/badmmdb"}, client: srv.Client()}
+		if changed, err := u.updateGeo(); err == nil || changed {
+			t.Fatalf("invalid mmdb changed=%v err=%v", changed, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, remoteGeoFile)); !os.IsNotExist(err) {
+			t.Fatalf("no database file should be written, stat err=%v", err)
+		}
+	})
+
+	t.Run("month fallback and all sources fail", func(t *testing.T) {
+		dir := t.TempDir()
+		// 第一个地址 404，回退到第二个地址成功
+		u := &updater{
+			dir:     dir,
+			geoURLs: []string{srv.URL + "/missing", srv.URL + "/ok"},
+			client:  srv.Client(),
+		}
+		if changed, err := u.updateGeo(); err != nil || !changed {
+			t.Fatalf("fallback update changed=%v err=%v", changed, err)
+		}
+
+		// 全部失败：返回错误且不落盘
+		dir2 := t.TempDir()
+		bad := &updater{dir: dir2, geoURLs: []string{srv.URL + "/missing"}, client: srv.Client()}
+		if _, err := bad.updateGeo(); err == nil {
+			t.Fatal("all sources failing must return error")
+		}
+	})
 }
