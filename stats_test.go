@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	gohomedns "github.com/esrrhs/gohome/dns"
 	"github.com/miekg/dns"
 )
 
@@ -262,6 +263,123 @@ func TestReadyzHandler(t *testing.T) {
 	defer httpReq.Body.Close()
 	if httpReq.StatusCode != http.StatusOK {
 		t.Fatalf("http readyz = %d, want 200", httpReq.StatusCode)
+	}
+}
+
+// stubCacheResolver 只覆盖缓存相关两个方法，其余接口方法由内嵌 nil 接口提升
+// （这些路径在本测试中不会被调用）。
+type stubCacheResolver struct {
+	gohomedns.Resolver
+	n int
+}
+
+func (s *stubCacheResolver) CacheLen() int { return s.n }
+func (s *stubCacheResolver) ClearCache()   { s.n = 0 }
+
+func TestRoutingResolverCache(t *testing.T) {
+	// inner 为 nil（gohome 初始化失败的兜底模式）时不 panic，按 0 处理。
+	rr := &routingResolver{}
+	if rr.cacheLen() != 0 || rr.flushCache() != 0 {
+		t.Fatal("nil inner should report zero cache and flush nothing")
+	}
+
+	stub := &stubCacheResolver{n: 5}
+	rr = &routingResolver{inner: stub}
+	if got := rr.cacheLen(); got != 5 {
+		t.Fatalf("cacheLen = %d, want 5", got)
+	}
+	if got := rr.flushCache(); got != 5 {
+		t.Fatalf("flushCache returned %d, want 5", got)
+	}
+	if got := rr.cacheLen(); got != 0 {
+		t.Fatalf("cacheLen after flush = %d, want 0", got)
+	}
+}
+
+func TestCacheFlushHandler(t *testing.T) {
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+
+	s := &statsServer{token: "tk", flushCache: func() int { return 7 }}
+
+	// 无鉴权 -> 401 且带 WWW-Authenticate
+	rec := httptest.NewRecorder()
+	s.cacheFlushHandler(rec, httptest.NewRequest(http.MethodPost, "/cache/flush", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token status = %d, want 401", rec.Code)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Error("401 should carry WWW-Authenticate")
+	}
+
+	// 带 token 但用 GET -> 405（写操作只接受 POST）
+	recGet := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/cache/flush", nil)
+	getReq.Header.Set("Authorization", "Bearer tk")
+	s.cacheFlushHandler(recGet, getReq)
+	if recGet.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want 405", recGet.Code)
+	}
+
+	// 带 token POST -> 200，返回清空前条目数，并累计 flush 计数
+	recPost := httptest.NewRecorder()
+	postReq := httptest.NewRequest(http.MethodPost, "/cache/flush", nil)
+	postReq.Header.Set("Authorization", "Bearer tk")
+	s.cacheFlushHandler(recPost, postReq)
+	if recPost.Code != http.StatusOK {
+		t.Fatalf("POST status = %d, want 200", recPost.Code)
+	}
+	var body map[string]int
+	if err := json.Unmarshal(recPost.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["cleared_entries"] != 7 {
+		t.Fatalf("cleared_entries = %d, want 7", body["cleared_entries"])
+	}
+	if got := metrics.cacheFlushes.Load(); got != 1 {
+		t.Fatalf("cacheFlushes = %d, want 1", got)
+	}
+
+	// 未配置 token 时 POST 放行（兼容默认回环部署）
+	open := &statsServer{flushCache: func() int { return 0 }}
+	recOpen := httptest.NewRecorder()
+	open.cacheFlushHandler(recOpen, httptest.NewRequest(http.MethodPost, "/cache/flush", nil))
+	if recOpen.Code != http.StatusOK {
+		t.Fatalf("open POST status = %d, want 200", recOpen.Code)
+	}
+}
+
+func TestCacheObservability(t *testing.T) {
+	old := cacheStatus
+	cacheStatus = func() int { return 42 }
+	t.Cleanup(func() { cacheStatus = old })
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+	metrics.cacheFlushes.Add(3)
+
+	s := &statsServer{}
+	rec := httptest.NewRecorder()
+	s.statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	var snap statsSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Cache.Entries != 42 || snap.Cache.Flushes != 3 {
+		t.Fatalf("cache snapshot = %+v, want entries 42 flushes 3", snap.Cache)
+	}
+
+	recM := httptest.NewRecorder()
+	s.metricsHandler(recM, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recM.Body.String()
+	for _, want := range []string{
+		"# TYPE yellowdns_cache_entries gauge",
+		"yellowdns_cache_entries 42",
+		"# TYPE yellowdns_cache_flushes_total counter",
+		"yellowdns_cache_flushes_total 3",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q\n%s", want, body)
+		}
 	}
 }
 
