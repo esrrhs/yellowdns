@@ -39,6 +39,8 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 * `-lof`: country database. The file shipped in this repo is DB-IP Country Lite
 * `-china`: extra domestic domain list. One domain per line, or dnsmasq `server=/name/address` lines
 * `-gfw`: extra interfered domain list, same format
+* `-update`: auto-update the remote domain lists at this interval (e.g. `-update 24h`); default `0` disables it. On startup the lists are checked once and applied immediately, then rechecked every interval
+* `-update-dir`: directory for the downloaded remote lists (`china.remote.txt`, `gfw.remote.txt`), default `.`. Lists already present there are loaded at startup even without `-update`
 * `-version`: show version and exit
 * other options: `./yellowdns -h`
 
@@ -46,6 +48,7 @@ Features & Routing:
 
 * **UDP + TCP Listening**: Large answers that exceed the UDP size limit are served over TCP as required by RFC 1035.
 * **Hot Reload (Unix)**: `kill -HUP <pid>` reloads the domain lists and the GeoIP database without dropping the listener; failed reloads keep the previous rules. SIGINT/SIGTERM shut the server down gracefully.
+* **Optional Auto-Update**: `-update 24h` keeps the embedded domestic/interfered lists fresh directly from dnsmasq-china-list and v2ray-rules-dat over HTTPS. Downloads are size-limited and health-checked (minimum domain count), saved atomically, and skipped when the content hash is unchanged; any failure keeps the previous rules. The GeoIP database is not auto-updated and ships with releases.
 * **Encrypted External Queries by Default**: `-exs` defaults to DNS-over-HTTPS, so interference cannot poison the external lookup itself. `-los`/`-exs` accept comma-separated lists of UDP, TCP and DoH addresses with in-order failover.
 * **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries, response caching and GeoIP anti-poisoning validation. The embedded domestic/interfered lists are loaded straight into the resolver.
 * **Routing Priority**:

@@ -51,7 +51,7 @@ func currentDomains() *domainData {
 	return d
 }
 
-func loadDomainLists(chinaFile, gfwFile string) (int, int, error) {
+func loadDomainLists(chinaFiles, gfwFiles []string) (int, int, error) {
 	china := domainSet{}
 	gfw := domainSet{}
 	if err := loadEmbed(china, "data/china.txt"); err != nil {
@@ -61,11 +61,21 @@ func loadDomainLists(chinaFile, gfwFile string) (int, int, error) {
 		return len(china), 0, err
 	}
 	var err error
-	if chinaFile != "" {
-		err = loadFile(china, chinaFile)
+	for _, f := range chinaFiles {
+		if f == "" {
+			continue
+		}
+		if err = loadFile(china, f); err != nil {
+			break
+		}
 	}
-	if gfwFile != "" && err == nil {
-		err = loadFile(gfw, gfwFile)
+	for _, f := range gfwFiles {
+		if f == "" || err != nil {
+			continue
+		}
+		if err = loadFile(gfw, f); err != nil {
+			break
+		}
 	}
 	if err != nil {
 		// 文件加载失败时保留旧快照，调用方按错误处理（启动退出/重载放弃）。
