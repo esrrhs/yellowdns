@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -114,7 +117,12 @@ func (s *statsCounters) snapshot() statsSnapshot {
 }
 
 // statsHandler 以 JSON 输出当前统计快照。
-func statsHandler(w http.ResponseWriter, r *http.Request) {
+func (s *statsServer) statsHandler(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="yellowdns-stats"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -127,26 +135,62 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// statsServer 是可选的统计 HTTP 服务，-stats 指定监听地址时启用。
-type statsServer struct {
-	srv *http.Server
+// authorized 校验 Bearer token；未配置 token 时不做限制（默认仅建议绑回环）。
+// 比较走常量时间，避免计时侧信道。
+func (s *statsServer) authorized(r *http.Request) bool {
+	if s.token == "" {
+		return true
+	}
+	h := r.Header.Get("Authorization")
+	const scheme = "Bearer "
+	if len(h) <= len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(h[len(scheme):]), []byte(s.token)) == 1
 }
 
-func startStatsServer(addr string) *statsServer {
+// statsServer 是可选的统计 HTTP 服务，-stats 指定监听地址时启用。
+type statsServer struct {
+	srv   *http.Server
+	token string
+}
+
+func startStatsServer(addr, token string) *statsServer {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stats", statsHandler)
-	s := &statsServer{srv: &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}}
+	s := &statsServer{
+		token: token,
+		srv: &http.Server{
+			Addr:              addr,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+	}
+	mux.HandleFunc("/stats", s.statsHandler)
 	go func() {
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			loggo.Error("stats server fail: %v", err)
 		}
 	}()
-	loggo.Info("stats endpoint on http://%s/stats", addr)
+	if token == "" {
+		loggo.Info("stats endpoint on http://%s/stats (no auth token configured)", addr)
+	} else {
+		loggo.Info("stats endpoint on http://%s/stats (bearer token required)", addr)
+	}
 	return s
+}
+
+// isLoopbackAddr 粗略判断监听地址是否只绑回环，用于无 token 时告警。
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback() || host == "localhost"
 }
 
 func (s *statsServer) close() {

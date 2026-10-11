@@ -42,6 +42,7 @@ If port 53 is already taken by another interface, listen on `127.0.0.1:53` inste
 * `-update`: auto-update the remote domain lists at this interval (e.g. `-update 24h`); default `0` disables it. On startup the lists are checked once and applied immediately, then rechecked every interval
 * `-update-dir`: directory for the downloaded remote lists (`china.remote.txt`, `gfw.remote.txt`), default `.`. Lists already present there are loaded at startup even without `-update`
 * `-stats`: HTTP listen address serving query statistics as JSON at `/stats` (e.g. `-stats 127.0.0.1:8053`); empty disables
+* `-stats-token`: bearer token required to access `/stats`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show up in `ps`). When unset the endpoint is open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
 * `-version`: show version and exit
 * other options: `./yellowdns -h`
 
@@ -50,7 +51,7 @@ Features & Routing:
 * **UDP + TCP Listening**: Large answers that exceed the UDP size limit are served over TCP as required by RFC 1035.
 * **Hot Reload (Unix)**: `kill -HUP <pid>` reloads the domain lists and the GeoIP database without dropping the listener; failed reloads keep the previous rules. SIGINT/SIGTERM shut the server down gracefully.
 * **Optional Auto-Update**: `-update 24h` keeps the embedded domestic/interfered lists fresh directly from dnsmasq-china-list and v2ray-rules-dat over HTTPS. Downloads are size-limited and health-checked (minimum domain count), saved atomically, and skipped when the content hash is unchanged; any failure keeps the previous rules. The GeoIP database is not auto-updated and ships with releases.
-* **Stats Endpoint**: `-stats 127.0.0.1:8053` exposes `GET /stats` with JSON counters: query totals by route (local/extern/auto), shadowed bypasses, resolver fallbacks, upstream attempts/errors, query types, domain list sizes, version and uptime. Disabled by default; bind to loopback unless the endpoint is trusted by your network.
+* **Stats Endpoint**: `-stats 127.0.0.1:8053` exposes `GET /stats` with JSON counters: query totals by route (local/extern/auto), shadowed bypasses, resolver fallbacks, upstream attempts/errors, query types, domain list sizes, version and uptime. Disabled by default; bind to loopback unless the endpoint is trusted by your network. Protect it with `-stats-token` (or `YELLOWDNS_STATS_TOKEN`): clients must send `Authorization: Bearer <token>`, and requests without it get `401`.
 * **Encrypted External Queries by Default**: `-exs` defaults to DNS-over-HTTPS, so interference cannot poison the external lookup itself. `-los`/`-exs` accept comma-separated lists of UDP, TCP and DoH addresses with in-order failover.
 * **Modern `gohome/dns` Integration**: Powered by `gohome/dns` with parallel dual-stack queries, response caching and GeoIP anti-poisoning validation. The embedded domestic/interfered lists are loaded straight into the resolver.
 * **Routing Priority**:
@@ -58,6 +59,13 @@ Features & Routing:
   2. The built-in interfered list goes directly to the external DNS.
   3. A more specific domestic name wins over a blocked parent. `google.com` is external, while `adservice.google.com` stays domestic. The reverse conflict (a blocked name under a domestic parent, such as `api.recaptcha.net` under `recaptcha.net`) is forced to the external path as well.
   4. Any other name is queried using parallel dual-stack racing. If the domestic answer is poisoned or outside the domestic region, the secure external response is automatically preferred.
+
+Example with token auth via environment variable:
+
+```
+YELLOWDNS_STATS_TOKEN=s3cret ./yellowdns -stats 127.0.0.1:8053
+curl -H "Authorization: Bearer s3cret" http://127.0.0.1:8053/stats
+```
 
 # Data
 

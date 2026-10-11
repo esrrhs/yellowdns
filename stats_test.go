@@ -12,6 +12,9 @@ import (
 )
 
 func TestStatsHandlerJSON(t *testing.T) {
+	if _, _, err := loadDomainLists(nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	metrics.reset()
 	t.Cleanup(metrics.reset)
 	metrics.total.Add(7)
@@ -25,8 +28,9 @@ func TestStatsHandlerJSON(t *testing.T) {
 	metrics.qtypeA.Add(5)
 	metrics.qtypeAAAA.Add(2)
 
+	s := &statsServer{}
 	rec := httptest.NewRecorder()
-	statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	s.statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
@@ -56,9 +60,75 @@ func TestStatsHandlerJSON(t *testing.T) {
 
 	// 非 GET 拒绝
 	rec2 := httptest.NewRecorder()
-	statsHandler(rec2, httptest.NewRequest(http.MethodPost, "/stats", nil))
+	s.statsHandler(rec2, httptest.NewRequest(http.MethodPost, "/stats", nil))
 	if rec2.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST status = %d, want 405", rec2.Code)
+	}
+}
+
+func TestStatsAuth(t *testing.T) {
+	s := &statsServer{token: "s3cret-token"}
+	authedReq := func(auth string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/stats", nil)
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		return r
+	}
+
+	// 无 token 头 -> 401 且带 WWW-Authenticate
+	rec := httptest.NewRecorder()
+	s.statsHandler(rec, authedReq(""))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no header status = %d, want 401", rec.Code)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Error("401 should carry WWW-Authenticate")
+	}
+
+	cases := []struct {
+		name string
+		auth string
+		want int
+	}{
+		{"wrong token", "Bearer wrong", http.StatusUnauthorized},
+		{"bad scheme", "Basic s3cret-token", http.StatusUnauthorized},
+		{"token without scheme", "s3cret-token", http.StatusUnauthorized},
+		{"empty bearer", "Bearer ", http.StatusUnauthorized},
+		{"correct", "Bearer s3cret-token", http.StatusOK},
+		{"scheme case-insensitive", "bearer s3cret-token", http.StatusOK},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		s.statsHandler(rec, authedReq(c.auth))
+		if rec.Code != c.want {
+			t.Errorf("%s: status = %d, want %d", c.name, rec.Code, c.want)
+		}
+	}
+
+	// 未配置 token 时放行（兼容默认行为）
+	open := &statsServer{}
+	rec = httptest.NewRecorder()
+	open.statsHandler(rec, authedReq(""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("no-token server status = %d, want 200", rec.Code)
+	}
+}
+
+func TestIsLoopbackAddr(t *testing.T) {
+	cases := map[string]bool{
+		"127.0.0.1:8053": true,
+		"[::1]:8053":     true,
+		"localhost:8053": true,
+		":8053":          false,
+		"0.0.0.0:8053":   false,
+		"[::]:8053":      false,
+		"192.168.1.2:80": false,
+	}
+	for addr, want := range cases {
+		if got := isLoopbackAddr(addr); got != want {
+			t.Errorf("isLoopbackAddr(%q) = %v, want %v", addr, got, want)
+		}
 	}
 }
 
