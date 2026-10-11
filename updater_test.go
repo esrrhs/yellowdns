@@ -419,16 +419,21 @@ func TestRequestRun(t *testing.T) {
 
 	// 第二次触发：内容未变，三源无错误、不重载
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 	res, err := u.requestRun(ctx)
 	if err != nil {
+		cancel()
 		t.Fatalf("requestRun: %v", err)
 	}
+	cancel()
 	if res.China.Error != "" || res.Gfw.Error != "" || res.GeoIP.Error != "" || res.Reloaded {
 		t.Fatalf("unchanged refresh = %+v, want no errors and no reload", res)
 	}
 
-	// 三个并发请求必须全部被串行处理并返回，不丢、不卡死
+	// 三个并发请求必须全部被串行处理并返回，不丢、不卡死。
+	// 用独立的宽 ctx：三次 runOnce 串行（每次仍要走 localhost 下载/gunzip），
+	// 不能与上一个请求共用已消耗过半的截止时间，否则慢机上会假性超时。
+	concCtx, concCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer concCancel()
 	var wg sync.WaitGroup
 	results := make([]updateResult, 3)
 	errs := make([]error, 3)
@@ -436,7 +441,7 @@ func TestRequestRun(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			results[i], errs[i] = u.requestRun(ctx)
+			results[i], errs[i] = u.requestRun(concCtx)
 		}(i)
 	}
 	wg.Wait()

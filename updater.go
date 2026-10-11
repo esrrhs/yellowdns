@@ -335,15 +335,18 @@ func (u *updater) updateGeo() (bool, error) {
 	if len(mmdb) < minGeoMMDBBytes {
 		return false, fmt.Errorf("geoip database only %d bytes, below healthy minimum %d", len(mmdb), minGeoMMDBBytes)
 	}
-	if err := validateMMDB(mmdb); err != nil {
-		return false, fmt.Errorf("invalid geoip database: %w", err)
-	}
 
+	// 与磁盘现有文件 hash 一致即视为 unchanged：该文件是此前校验通过后原子写入的，
+	// 内容相同必然同样有效，直接跳过昂贵的整库解析（8MB mmdb 的 FromBytes）。
 	dst := u.geoPath()
 	if cur, err := os.ReadFile(dst); err == nil && sha256.Sum256(cur) == sha256.Sum256(mmdb) {
 		loggo.Info("geoip database unchanged (%d bytes)", len(mmdb))
 		return false, nil
 	}
+	if err := validateMMDB(mmdb); err != nil {
+		return false, fmt.Errorf("invalid geoip database: %w", err)
+	}
+
 	tmp := dst + ".tmp"
 	if err := os.WriteFile(tmp, mmdb, 0o644); err != nil {
 		return false, err

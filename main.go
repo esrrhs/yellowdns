@@ -152,6 +152,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	routeLabel := routeAutoLabel
 	defer func() {
 		metrics.observeLatency(routeLabel, time.Since(start))
+		metrics.observeResult(resp, err)
 	}()
 	if len(req.Question) == 0 {
 		return nil, errors.New("empty dns question")
@@ -232,6 +233,14 @@ func (r *routingResolver) cacheLen() int {
 		return 0
 	}
 	return r.inner.CacheLen()
+}
+
+// cacheStats 返回 gohome 响应缓存条目数与累计命中/未命中；resolver 不可用时全为 0。
+func (r *routingResolver) cacheStats() (int, int64, int64) {
+	if r.inner == nil {
+		return 0, 0, 0
+	}
+	return r.inner.CacheLen(), r.inner.CacheHits(), r.inner.CacheMisses()
 }
 
 // flushCache 清空 gohome 响应缓存，返回清空前的条目数（供运维确认效果）。
@@ -417,7 +426,7 @@ func main() {
 		timeout:  timeoutD,
 	}
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
-	cacheStatus = rr.cacheLen
+	cacheStats = rr.cacheStats
 	if stats != nil {
 		stats.flushCache = rr.flushCache
 	}
