@@ -21,3 +21,4 @@ dist/
 
 # Runtime logs
 *.log
+*.stderr
