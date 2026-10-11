@@ -43,7 +43,7 @@ type updater struct {
 	gfwURL   string
 	dir      string
 	interval time.Duration
-	apply    func(chinaFiles, gfwFiles []string) (int, int, error)
+	apply    func(chinaFiles, gfwFiles []string) (int, int, int, error)
 	// extraChina/extraGfw 是 -china/-gfw 用户附加文件，随远端更新一并重载。
 	extraChina []string
 	extraGfw   []string
@@ -95,12 +95,12 @@ func (u *updater) runOnce() {
 func (u *updater) applyRemote() {
 	chinaFiles := append(remoteIfExist(u.chinaPath()), u.extraChina...)
 	gfwFiles := append(remoteIfExist(u.gfwPath()), u.extraGfw...)
-	cn, gfw, err := u.apply(chinaFiles, gfwFiles)
+	cn, gfw, hostsN, err := u.apply(chinaFiles, gfwFiles)
 	if err != nil {
 		loggo.Error("apply remote lists fail, keep old rules: %v", err)
 		return
 	}
-	loggo.Info("remote lists applied china %d gfw %d shadowed %d", cn, gfw, len(currentDomains().shadowed))
+	loggo.Info("remote lists applied china %d gfw %d hosts %d shadowed %d", cn, gfw, hostsN, len(currentDomains().shadowed))
 }
 
 // updateOne 下载并校验单个列表；内容与现有文件一致时不重写。

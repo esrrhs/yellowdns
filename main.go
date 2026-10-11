@@ -192,17 +192,18 @@ func exchangeOne(ctx context.Context, u exchangeClient, req *dns.Msg, timeout ti
 // reload 重新加载内置、远端与用户附加的域名列表及 hosts 规则，热替换 resolver
 // 的分流树与 GeoIP 库，并清空响应缓存，使新规则对下一次查询立即生效。
 // 任一文件读取失败时整体放弃并保留旧状态。
-func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoFile string) (chinaN, gfwN int, err error) {
+func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoFile string) (chinaN, gfwN, hostsN int, err error) {
 	// 两份规则都先解析成功再依次替换快照：任一失败，旧状态完整保留。
 	hostsSnap, err := parseHostsFiles(hostsFiles)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	chinaN, gfwN, err = loadDomainLists(chinaFiles, gfwFiles)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	hostsState.Store(hostsSnap)
+	hostsN = len(hostsSnap.exact) + len(hostsSnap.wildcard)
 	d := currentDomains()
 	if r.inner != nil {
 		r.inner.UpdateDirectDomains(domainKeys(d.china))
@@ -213,7 +214,7 @@ func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoF
 		// 已缓存的应答不会重新经过分流判定，清掉以免旧路由残留到 TTL 到期。
 		r.inner.ClearCache()
 	}
-	return chinaN, gfwN, nil
+	return chinaN, gfwN, hostsN, nil
 }
 
 func main() {
@@ -357,7 +358,7 @@ func main() {
 		stats = startStatsServer(*statsAddr, token)
 	}
 
-	apply := func(chinaFiles, gfwFiles []string) (int, int, error) {
+	apply := func(chinaFiles, gfwFiles []string) (int, int, int, error) {
 		return rr.reload(chinaFiles, gfwFiles, userHostsFiles, *localregionfile)
 	}
 
@@ -378,19 +379,19 @@ func main() {
 	done := make(chan struct{})
 	// HUP 重载的范围与启动一致：已落盘的远端列表 + 用户附加文件，
 	// 否则 HUP 会把自动更新已生效的规则悄悄回退。
-	reloadAll := func() (int, int, error) {
+	reloadAll := func() (int, int, int, error) {
 		return apply(
 			append(remoteIfExist(remoteChinaPath), userChinaFiles...),
 			append(remoteIfExist(remoteGfwPath), userGfwFiles...))
 	}
 	setupSignalHandler(
 		func() {
-			cn, gfw, e := reloadAll()
+			cn, gfw, hostsN, e := reloadAll()
 			if e != nil {
 				loggo.Error("reload fail, keep old rules: %v", e)
 				return
 			}
-			loggo.Info("reload ok china %d gfw %d shadowed %d", cn, gfw, len(currentDomains().shadowed))
+			loggo.Info("reload ok china %d gfw %d hosts %d shadowed %d", cn, gfw, hostsN, len(currentDomains().shadowed))
 		},
 		func() {
 			loggo.Info("stopping...")
