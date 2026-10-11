@@ -47,10 +47,12 @@ type statsCounters struct {
 	qErrors    atomic.Int64
 	truncated  atomic.Int64
 	rcNoerror  atomic.Int64
+	rcNodata   atomic.Int64 // NOERROR 但 Answer 段为空（NODATA），是 noerror 的子集
 	rcNxdomain atomic.Int64
 	rcServfail atomic.Int64
 	rcRefused  atomic.Int64
 	rcOther    atomic.Int64
+	inFlight   atomic.Int64 // 当前正在处理、尚未应答的查询数（gauge，Add ±1）
 }
 
 var metrics = &statsCounters{}
@@ -113,6 +115,9 @@ func (s *statsCounters) observeResult(resp *dns.Msg, err error) {
 	switch resp.Rcode {
 	case dns.RcodeSuccess:
 		s.rcNoerror.Add(1)
+		if len(resp.Answer) == 0 {
+			s.rcNodata.Add(1)
+		}
 	case dns.RcodeNameError:
 		s.rcNxdomain.Add(1)
 	case dns.RcodeServerFailure:
@@ -411,10 +416,12 @@ type statsSnapshot struct {
 		Shadowed  int64 `json:"shadowed"`
 		Fallback  int64 `json:"fallback"`
 		Hosts     int64 `json:"hosts"`
+		InFlight  int64 `json:"in_flight"` // 当前在途查询数（gauge）
 		Errors    int64 `json:"errors"`    // Exchange 返回错误/无应答的查询数
 		Truncated int64 `json:"truncated"` // TC 位置位的应答数（提示需走 TCP）
 		Rcodes    struct {
 			NoError  int64 `json:"noerror"`
+			Nodata   int64 `json:"nodata"` // NOERROR 且无 Answer（NODATA），为 noerror 的子集
 			NXDomain int64 `json:"nxdomain"`
 			ServFail int64 `json:"servfail"`
 			Refused  int64 `json:"refused"`
@@ -422,6 +429,16 @@ type statsSnapshot struct {
 		} `json:"responses_by_rcode"`
 		Latency map[string]latencySnapshot `json:"latency_ms"`
 	} `json:"queries"`
+	GeoIP struct {
+		Loaded               bool   `json:"loaded"` // 启动/更新后是否成功采集过库元信息
+		Path                 string `json:"path"`
+		Type                 string `json:"type"`                    // mmdb database_type
+		SizeBytes            int64  `json:"size_bytes"`
+		ModifiedUnixSeconds  int64  `json:"modified_timestamp_seconds"` // 文件落盘时间
+		BuildUnixSeconds     int64  `json:"build_timestamp_seconds"`    // 发行方构建时间（build_epoch）
+		FileAgeSeconds       int64  `json:"file_age_seconds"`           // 距上次落盘
+		BuildAgeSeconds      int64  `json:"build_age_seconds"`          // 距发行方构建
+	} `json:"geoip"`
 	Upstreams struct {
 		Attempts int64                    `json:"attempts"`
 		Errors   int64                    `json:"errors"`
@@ -446,6 +463,13 @@ type statsSnapshot struct {
 	} `json:"updates"`
 }
 
+func boolToInt64(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 func (s *statsCounters) snapshot() statsSnapshot {
 	var snap statsSnapshot
 	snap.Version = version
@@ -463,9 +487,11 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Queries.Shadowed = s.shadowed.Load()
 	snap.Queries.Fallback = s.fallback.Load()
 	snap.Queries.Hosts = s.hostsHits.Load()
+	snap.Queries.InFlight = s.inFlight.Load()
 	snap.Queries.Errors = s.qErrors.Load()
 	snap.Queries.Truncated = s.truncated.Load()
 	snap.Queries.Rcodes.NoError = s.rcNoerror.Load()
+	snap.Queries.Rcodes.Nodata = s.rcNodata.Load()
 	snap.Queries.Rcodes.NXDomain = s.rcNxdomain.Load()
 	snap.Queries.Rcodes.ServFail = s.rcServfail.Load()
 	snap.Queries.Rcodes.Refused = s.rcRefused.Load()
@@ -498,6 +524,17 @@ func (s *statsCounters) snapshot() statsSnapshot {
 		"china": chinaH,
 		"gfw":   gfwH,
 		"geoip": geoH,
+	}
+	if gm := geoMetaPtr.Load(); gm != nil {
+		now := time.Now()
+		snap.GeoIP.Loaded = true
+		snap.GeoIP.Path = gm.path
+		snap.GeoIP.Type = gm.dbType
+		snap.GeoIP.SizeBytes = gm.size
+		snap.GeoIP.ModifiedUnixSeconds = gm.modified.Unix()
+		snap.GeoIP.BuildUnixSeconds = gm.build.Unix()
+		snap.GeoIP.FileAgeSeconds = int64(now.Sub(gm.modified).Seconds())
+		snap.GeoIP.BuildAgeSeconds = int64(now.Sub(gm.build).Seconds())
 	}
 	return snap
 }
@@ -543,6 +580,8 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_queries_hosts_total %d\n", snap.Queries.Hosts)
 	writeHelp("yellowdns_queries_total_all", "counter", "Total inbound queries.")
 	fmt.Fprintf(&b, "yellowdns_queries_total_all %d\n", snap.Queries.Total)
+	writeHelp("yellowdns_queries_in_flight", "gauge", "Queries currently being processed, not yet answered.")
+	fmt.Fprintf(&b, "yellowdns_queries_in_flight %d\n", snap.Queries.InFlight)
 
 	writeHelp("yellowdns_queries_qtype_total", "counter", "Inbound queries by question type.")
 	fmt.Fprintf(&b, "yellowdns_queries_qtype_total{type=\"A\"} %d\n", snap.Qtypes.A)
@@ -551,6 +590,7 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 	writeHelp("yellowdns_responses_total", "counter", "Queries answered, by DNS response code.")
 	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"noerror\"} %d\n", snap.Queries.Rcodes.NoError)
+	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"nodata\"} %d\n", snap.Queries.Rcodes.Nodata)
 	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"nxdomain\"} %d\n", snap.Queries.Rcodes.NXDomain)
 	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"servfail\"} %d\n", snap.Queries.Rcodes.ServFail)
 	fmt.Fprintf(&b, "yellowdns_responses_total{rcode=\"refused\"} %d\n", snap.Queries.Rcodes.Refused)
@@ -616,6 +656,20 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&b, "yellowdns_update_success_total{source=%q} %d\n", src, h.Successes)
 		fmt.Fprintf(&b, "yellowdns_update_failures_total{source=%q} %d\n", src, h.Failures)
 		fmt.Fprintf(&b, "yellowdns_update_consecutive_failures{source=%q} %d\n", src, h.ConsecutiveFailures)
+	}
+
+	// GeoIP 库新鲜度：未加载时只输出 loaded=0，不输出带空 label 的 info 序列。
+	writeHelp("yellowdns_geoip_loaded", "gauge", "1 if GeoIP database metadata was successfully captured at startup or after an update.")
+	fmt.Fprintf(&b, "yellowdns_geoip_loaded %d\n", boolToInt64(snap.GeoIP.Loaded))
+	if snap.GeoIP.Loaded {
+		writeHelp("yellowdns_geoip_info", "gauge", "GeoIP database metadata; always 1, carries type/path labels.")
+		fmt.Fprintf(&b, "yellowdns_geoip_info{type=%q,path=%q} 1\n", snap.GeoIP.Type, snap.GeoIP.Path)
+		writeHelp("yellowdns_geoip_file_size_bytes", "gauge", "GeoIP database file size in bytes.")
+		fmt.Fprintf(&b, "yellowdns_geoip_file_size_bytes %d\n", snap.GeoIP.SizeBytes)
+		writeHelp("yellowdns_geoip_modified_timestamp_seconds", "gauge", "GeoIP database file mtime as Unix timestamp.")
+		fmt.Fprintf(&b, "yellowdns_geoip_modified_timestamp_seconds %d\n", snap.GeoIP.ModifiedUnixSeconds)
+		writeHelp("yellowdns_geoip_build_timestamp_seconds", "gauge", "GeoIP database vendor build epoch as Unix timestamp.")
+		fmt.Fprintf(&b, "yellowdns_geoip_build_timestamp_seconds %d\n", snap.GeoIP.BuildUnixSeconds)
 	}
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
