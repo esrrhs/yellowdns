@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,8 @@ var updateStatusInfo func() (enabled bool, interval time.Duration)
 
 func (s *statsCounters) reset() {
 	*s = statsCounters{}
+	routeLatencies.reset()
+	upstreamRegistry.reset()
 }
 
 // observeQuery 记录一次入站查询的总数与 qtype 分布。
@@ -82,6 +85,280 @@ func (s *statsCounters) observeRoute(mode int, shadowed bool) {
 	}
 }
 
+// observeLatency 记录一次端到端查询耗时，按最终路由归入对应直方图。
+func (s *statsCounters) observeLatency(route string, d time.Duration) {
+	routeLatencies.observe(route, d)
+}
+
+// 路由标签：与 domainlist 的 route* 常量及 hosts 合成应答路径对应。
+const (
+	routeHostsLabel  = "hosts"
+	routeLocalLabel  = "local"
+	routeExternLabel = "extern"
+	routeAutoLabel   = "auto"
+)
+
+func routeLabelOf(mode int) string {
+	switch mode {
+	case routeLocal:
+		return routeLocalLabel
+	case routeExtern:
+		return routeExternLabel
+	default:
+		return routeAutoLabel
+	}
+}
+
+// latencyBucketBoundsMs 是端到端查询延迟直方图的桶上界（毫秒），其后是隐式 +Inf 桶。
+var latencyBucketBoundsMs = [11]int64{1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000}
+
+// latencyHistogram 固定桶直方图，查询热路径仅做原子加法。
+type latencyHistogram struct {
+	count   atomic.Int64
+	sumMs   atomic.Int64
+	buckets [len(latencyBucketBoundsMs) + 1]atomic.Int64
+}
+
+func (h *latencyHistogram) observe(ms int64) {
+	h.count.Add(1)
+	h.sumMs.Add(ms)
+	for i, bound := range latencyBucketBoundsMs {
+		if ms <= bound {
+			h.buckets[i].Add(1)
+			return
+		}
+	}
+	h.buckets[len(latencyBucketBoundsMs)].Add(1)
+}
+
+func (h *latencyHistogram) reset() {
+	h.count.Store(0)
+	h.sumMs.Store(0)
+	for i := range h.buckets {
+		h.buckets[i].Store(0)
+	}
+}
+
+// latencyBucketSnapshot 是单个桶的计数；Inf 为 true 时 LeMs 无意义，表示 +Inf 桶。
+type latencyBucketSnapshot struct {
+	LeMs  int64 `json:"le_ms"`
+	Inf   bool  `json:"inf,omitempty"`
+	Count int64 `json:"count"`
+}
+
+type latencySnapshot struct {
+	Count   int64                   `json:"count"`
+	SumMs   int64                   `json:"sum_ms"`
+	Buckets []latencyBucketSnapshot `json:"buckets"`
+}
+
+func (h *latencyHistogram) snapshot() latencySnapshot {
+	snap := latencySnapshot{
+		Count:   h.count.Load(),
+		SumMs:   h.sumMs.Load(),
+		Buckets: make([]latencyBucketSnapshot, 0, len(latencyBucketBoundsMs)+1),
+	}
+	for i, bound := range latencyBucketBoundsMs {
+		snap.Buckets = append(snap.Buckets, latencyBucketSnapshot{LeMs: bound, Count: h.buckets[i].Load()})
+	}
+	snap.Buckets = append(snap.Buckets, latencyBucketSnapshot{
+		Inf:   true,
+		Count: h.buckets[len(latencyBucketBoundsMs)].Load(),
+	})
+	return snap
+}
+
+// routeLatencySet 持有各最终路由的延迟直方图，集合初始化后不再变更。
+type routeLatencySet struct {
+	order []string
+	m     map[string]*latencyHistogram
+}
+
+func newRouteLatencySet() *routeLatencySet {
+	order := []string{routeHostsLabel, routeLocalLabel, routeExternLabel, routeAutoLabel}
+	m := make(map[string]*latencyHistogram, len(order))
+	for _, r := range order {
+		m[r] = &latencyHistogram{}
+	}
+	return &routeLatencySet{order: order, m: m}
+}
+
+var routeLatencies = newRouteLatencySet()
+
+func (s *routeLatencySet) observe(route string, d time.Duration) {
+	h := s.m[route]
+	if h == nil {
+		h = s.m[routeAutoLabel]
+	}
+	h.observe(d.Milliseconds())
+}
+
+func (s *routeLatencySet) reset() {
+	for _, h := range s.m {
+		h.reset()
+	}
+}
+
+// latencyAgg 是单上游的简单延迟汇总（count/sum/min/max，毫秒）；min 为 0 表示无样本。
+type latencyAgg struct {
+	count atomic.Int64
+	sumMs atomic.Int64
+	minMs atomic.Int64
+	maxMs atomic.Int64
+}
+
+func (a *latencyAgg) observe(ms int64) {
+	a.count.Add(1)
+	a.sumMs.Add(ms)
+	for {
+		cur := a.minMs.Load()
+		if cur != 0 && cur <= ms {
+			break
+		}
+		if a.minMs.CompareAndSwap(cur, ms) {
+			break
+		}
+	}
+	for {
+		cur := a.maxMs.Load()
+		if cur >= ms {
+			break
+		}
+		if a.maxMs.CompareAndSwap(cur, ms) {
+			break
+		}
+	}
+}
+
+func (a *latencyAgg) reset() {
+	a.count.Store(0)
+	a.sumMs.Store(0)
+	a.minMs.Store(0)
+	a.maxMs.Store(0)
+}
+
+type latencyAggSnapshot struct {
+	Count int64 `json:"count"`
+	SumMs int64 `json:"sum_ms"`
+	MinMs int64 `json:"min_ms"`
+	MaxMs int64 `json:"max_ms"`
+}
+
+// perUpstreamCounters 是单个配置上游（local/extern 组内按地址区分）的健康计数。
+type perUpstreamCounters struct {
+	name        string
+	group       string
+	attempts    atomic.Int64
+	failures    atomic.Int64
+	lastAttempt atomic.Int64
+	lastSuccess atomic.Int64
+	lastError   atomic.Value // 存放 string，未记录时为 nil
+	latency     latencyAgg
+}
+
+func (c *perUpstreamCounters) lastErrorText() string {
+	if v := c.lastError.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+// maxUpstreamErrorLen 限制最近错误文本长度，避免异常长错误刷屏 /stats。
+const maxUpstreamErrorLen = 200
+
+func (c *perUpstreamCounters) record(ok bool, d time.Duration, err error) {
+	now := time.Now().Unix()
+	c.attempts.Add(1)
+	c.lastAttempt.Store(now)
+	c.latency.observe(d.Milliseconds())
+	if ok {
+		c.lastSuccess.Store(now)
+		return
+	}
+	c.failures.Add(1)
+	if err != nil {
+		msg := err.Error()
+		if len(msg) > maxUpstreamErrorLen {
+			msg = msg[:maxUpstreamErrorLen]
+		}
+		c.lastError.Store(msg)
+	}
+}
+
+type upstreamServerSnapshot struct {
+	Name        string             `json:"name"`
+	Group       string             `json:"group"`
+	Attempts    int64              `json:"attempts"`
+	Errors      int64              `json:"errors"`
+	LastAttempt int64              `json:"last_attempt_unixtime"`
+	LastSuccess int64              `json:"last_success_unixtime"`
+	LastError   string             `json:"last_error"`
+	Latency     latencyAggSnapshot `json:"latency_ms"`
+}
+
+// upstreamStatsRegistry 收集所有已配置上游的计数器；register 在启动期完成，
+// 之后热路径直接持有返回的指针记录，无需加锁。
+type upstreamStatsRegistry struct {
+	mu    sync.Mutex
+	order []string
+	items map[string]*perUpstreamCounters
+}
+
+func newUpstreamStatsRegistry() *upstreamStatsRegistry {
+	return &upstreamStatsRegistry{items: map[string]*perUpstreamCounters{}}
+}
+
+var upstreamRegistry = newUpstreamStatsRegistry()
+
+func upstreamKey(group, name string) string { return group + "|" + name }
+
+// registerUpstream 返回该组/地址对应的计数器；重复注册同一组合返回同一项。
+func registerUpstream(group, name string) *perUpstreamCounters {
+	key := upstreamKey(group, name)
+	upstreamRegistry.mu.Lock()
+	defer upstreamRegistry.mu.Unlock()
+	if c, ok := upstreamRegistry.items[key]; ok {
+		return c
+	}
+	c := &perUpstreamCounters{name: name, group: group}
+	upstreamRegistry.items[key] = c
+	upstreamRegistry.order = append(upstreamRegistry.order, key)
+	return c
+}
+
+func (r *upstreamStatsRegistry) snapshot() []upstreamServerSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]upstreamServerSnapshot, 0, len(r.order))
+	for _, key := range r.order {
+		c := r.items[key]
+		out = append(out, upstreamServerSnapshot{
+			Name:        c.name,
+			Group:       c.group,
+			Attempts:    c.attempts.Load(),
+			Errors:      c.failures.Load(),
+			LastAttempt: c.lastAttempt.Load(),
+			LastSuccess: c.lastSuccess.Load(),
+			LastError:   c.lastErrorText(),
+			Latency: latencyAggSnapshot{
+				Count: c.latency.count.Load(),
+				SumMs: c.latency.sumMs.Load(),
+				MinMs: c.latency.minMs.Load(),
+				MaxMs: c.latency.maxMs.Load(),
+			},
+		})
+	}
+	return out
+}
+
+// reset 清空注册项（测试用）；已分发到 namedUpstream 的旧指针不影响新注册。
+func (r *upstreamStatsRegistry) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.order = nil
+	r.items = map[string]*perUpstreamCounters{}
+}
+
 // statsSnapshot 是 /stats 输出的 JSON 结构。
 type statsSnapshot struct {
 	Version       string  `json:"version"`
@@ -93,17 +370,19 @@ type statsSnapshot struct {
 		Hosts    int `json:"hosts"`
 	} `json:"domains"`
 	Queries struct {
-		Total    int64 `json:"total"`
-		Local    int64 `json:"local"`
-		Extern   int64 `json:"extern"`
-		Auto     int64 `json:"auto"`
-		Shadowed int64 `json:"shadowed"`
-		Fallback int64 `json:"fallback"`
-		Hosts    int64 `json:"hosts"`
+		Total    int64                      `json:"total"`
+		Local    int64                      `json:"local"`
+		Extern   int64                      `json:"extern"`
+		Auto     int64                      `json:"auto"`
+		Shadowed int64                      `json:"shadowed"`
+		Fallback int64                      `json:"fallback"`
+		Hosts    int64                      `json:"hosts"`
+		Latency  map[string]latencySnapshot `json:"latency_ms"`
 	} `json:"queries"`
 	Upstreams struct {
-		Attempts int64 `json:"attempts"`
-		Errors   int64 `json:"errors"`
+		Attempts int64                    `json:"attempts"`
+		Errors   int64                    `json:"errors"`
+		Servers  []upstreamServerSnapshot `json:"servers"`
 	} `json:"upstreams"`
 	Cache struct {
 		Entries int   `json:"entries"` // resolver 响应缓存当前条目（含未懒清理的过期项）
@@ -140,6 +419,11 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Queries.Hosts = s.hostsHits.Load()
 	snap.Upstreams.Attempts = s.upAttempts.Load()
 	snap.Upstreams.Errors = s.upErrors.Load()
+	snap.Upstreams.Servers = upstreamRegistry.snapshot()
+	snap.Queries.Latency = make(map[string]latencySnapshot, len(routeLatencies.order))
+	for _, route := range routeLatencies.order {
+		snap.Queries.Latency[route] = routeLatencies.m[route].snapshot()
+	}
 	if cacheStatus != nil {
 		snap.Cache.Entries = cacheStatus()
 	}
@@ -213,6 +497,36 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_upstream_attempts_total %d\n", snap.Upstreams.Attempts)
 	writeHelp("yellowdns_upstream_errors_total", "counter", "Failed upstream exchange attempts.")
 	fmt.Fprintf(&b, "yellowdns_upstream_errors_total %d\n", snap.Upstreams.Errors)
+
+	writeHelp("yellowdns_upstream_server_attempts_total", "counter", "Exchange attempts per configured fallback upstream.")
+	writeHelp("yellowdns_upstream_server_errors_total", "counter", "Failed exchange attempts per configured fallback upstream.")
+	writeHelp("yellowdns_upstream_server_last_attempt_timestamp_seconds", "gauge", "Unix timestamp of the last attempt per fallback upstream; 0 means never attempted.")
+	writeHelp("yellowdns_upstream_server_last_success_timestamp_seconds", "gauge", "Unix timestamp of the last success per fallback upstream; 0 means never succeeded.")
+	writeHelp("yellowdns_upstream_server_response_seconds", "summary", "Fallback upstream response time (sum/count), including failed attempts.")
+	for _, srv := range snap.Upstreams.Servers {
+		fmt.Fprintf(&b, "yellowdns_upstream_server_attempts_total{group=%q,upstream=%q} %d\n", srv.Group, srv.Name, srv.Attempts)
+		fmt.Fprintf(&b, "yellowdns_upstream_server_errors_total{group=%q,upstream=%q} %d\n", srv.Group, srv.Name, srv.Errors)
+		fmt.Fprintf(&b, "yellowdns_upstream_server_last_attempt_timestamp_seconds{group=%q,upstream=%q} %d\n", srv.Group, srv.Name, srv.LastAttempt)
+		fmt.Fprintf(&b, "yellowdns_upstream_server_last_success_timestamp_seconds{group=%q,upstream=%q} %d\n", srv.Group, srv.Name, srv.LastSuccess)
+		fmt.Fprintf(&b, "yellowdns_upstream_server_response_seconds_sum{group=%q,upstream=%q} %g\n", srv.Group, srv.Name, float64(srv.Latency.SumMs)/1000)
+		fmt.Fprintf(&b, "yellowdns_upstream_server_response_seconds_count{group=%q,upstream=%q} %d\n", srv.Group, srv.Name, srv.Latency.Count)
+	}
+
+	writeHelp("yellowdns_query_duration_seconds", "histogram", "End-to-end query handling time by final route (hosts/local/extern/auto).")
+	for _, route := range routeLatencies.order {
+		h := snap.Queries.Latency[route]
+		var cumulative int64
+		for _, bk := range h.Buckets {
+			if !bk.Inf {
+				cumulative += bk.Count
+				fmt.Fprintf(&b, "yellowdns_query_duration_seconds_bucket{route=%q,le=%q} %d\n", route, fmt.Sprintf("%g", float64(bk.LeMs)/1000), cumulative)
+			}
+		}
+		// +Inf 桶累计值等于总样本数。
+		fmt.Fprintf(&b, "yellowdns_query_duration_seconds_bucket{route=%q,le=\"+Inf\"} %d\n", route, h.Count)
+		fmt.Fprintf(&b, "yellowdns_query_duration_seconds_sum{route=%q} %g\n", route, float64(h.SumMs)/1000)
+		fmt.Fprintf(&b, "yellowdns_query_duration_seconds_count{route=%q} %d\n", route, h.Count)
+	}
 
 	writeHelp("yellowdns_cache_entries", "gauge", "DNS response cache entries currently held by the resolver.")
 	fmt.Fprintf(&b, "yellowdns_cache_entries %d\n", snap.Cache.Entries)

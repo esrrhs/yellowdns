@@ -192,10 +192,12 @@ func TestUpstreamFor(t *testing.T) {
 	if s2.addr != "1.2.3.4:53" || s2.network != "tcp" {
 		t.Fatalf("tcp client: %+v", s2)
 	}
-	if _, err := buildUpstreams(" , ", time.Second); err == nil {
+	// buildUpstreams 会注册分上游指标，测试结束清掉，避免污染同包其他测试的快照断言。
+	t.Cleanup(metrics.reset)
+	if _, err := buildUpstreams("local", " , ", time.Second); err == nil {
 		t.Error("empty list should error")
 	}
-	if _, err := buildUpstreams("8.8.8.8,https://1.1.1.1/dns-query", time.Second); err != nil {
+	if _, err := buildUpstreams("local", "8.8.8.8,https://1.1.1.1/dns-query", time.Second); err != nil {
 		t.Fatalf("mixed list: %v", err)
 	}
 }

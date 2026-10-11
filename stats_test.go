@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -564,6 +565,127 @@ func TestUpdateObservability(t *testing.T) {
 		`yellowdns_update_failures_total{source="gfw"} 1`,
 		`yellowdns_update_consecutive_failures{source="gfw"} 1`,
 		`yellowdns_update_success_total{source="china"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q", want)
+		}
+	}
+}
+
+// TestLatencyHistogram 验证延迟样本归入正确的桶且累计计数/sum 正确。
+func TestLatencyHistogram(t *testing.T) {
+	h := &latencyHistogram{}
+	// 0ms 与 1ms 都落 le=1 桶；7ms 落 le=10；6000ms 落 +Inf。
+	for _, ms := range []int64{0, 1, 7, 6000} {
+		h.observe(ms)
+	}
+	snap := h.snapshot()
+	if snap.Count != 4 || snap.SumMs != 6008 {
+		t.Fatalf("count/sum = %d/%d, want 4/6008", snap.Count, snap.SumMs)
+	}
+	find := func(le int64) int64 {
+		for _, b := range snap.Buckets {
+			if !b.Inf && b.LeMs == le {
+				return b.Count
+			}
+		}
+		return -1
+	}
+	if got := find(1); got != 2 {
+		t.Errorf("le=1 bucket = %d, want 2", got)
+	}
+	if got := find(10); got != 1 {
+		t.Errorf("le=10 bucket = %d, want 1", got)
+	}
+	var infCount int64
+	for _, b := range snap.Buckets {
+		if b.Inf {
+			infCount = b.Count
+		}
+	}
+	if infCount != 1 {
+		t.Errorf("+Inf bucket = %d, want 1", infCount)
+	}
+}
+
+// TestPerUpstreamCountersRecord 验证单上游成功/失败计数、最近错误与延迟汇总。
+func TestPerUpstreamCountersRecord(t *testing.T) {
+	c := &perUpstreamCounters{name: "1.2.3.4:53", group: "local"}
+	c.record(false, 7*time.Millisecond, errors.New("boom"))
+	c.record(true, 3*time.Millisecond, nil)
+	c.record(true, 12*time.Millisecond, nil)
+
+	if c.attempts.Load() != 3 || c.failures.Load() != 1 {
+		t.Fatalf("attempts/failures = %d/%d", c.attempts.Load(), c.failures.Load())
+	}
+	if c.lastSuccess.Load() == 0 || c.lastAttempt.Load() < c.lastSuccess.Load() {
+		t.Fatalf("timestamps wrong: attempt=%d success=%d", c.lastAttempt.Load(), c.lastSuccess.Load())
+	}
+	if c.lastErrorText() != "boom" {
+		t.Fatalf("last error = %q", c.lastErrorText())
+	}
+	if c.latency.count.Load() != 3 || c.latency.sumMs.Load() != 22 ||
+		c.latency.minMs.Load() != 3 || c.latency.maxMs.Load() != 12 {
+		t.Fatalf("latency agg = count=%d sum=%d min=%d max=%d",
+			c.latency.count.Load(), c.latency.sumMs.Load(), c.latency.minMs.Load(), c.latency.maxMs.Load())
+	}
+
+	// 超长错误被截断，避免 /stats 被异常长文本刷屏。
+	long := strings.Repeat("x", maxUpstreamErrorLen+50)
+	c.record(false, time.Millisecond, errors.New(long))
+	if got := c.lastErrorText(); len(got) != maxUpstreamErrorLen {
+		t.Fatalf("truncated error len = %d, want %d", len(got), maxUpstreamErrorLen)
+	}
+}
+
+// TestUpstreamAndLatencyObservability 验证分上游指标与路由延迟直方图在
+// /stats JSON 与 /metrics 文本中均正确暴露。
+func TestUpstreamAndLatencyObservability(t *testing.T) {
+	metrics.reset()
+	t.Cleanup(metrics.reset)
+	bad := registerUpstream("local", "127.0.0.1:9")
+	bad.record(false, 2*time.Millisecond, errors.New("dial refused"))
+	good := registerUpstream("extern", "https://1.1.1.1/dns-query")
+	good.record(true, 25*time.Millisecond, nil)
+	metrics.observeLatency(routeLocalLabel, 3*time.Millisecond)
+	metrics.observeLatency(routeExternLabel, 30*time.Millisecond)
+
+	s := &statsServer{}
+	rec := httptest.NewRecorder()
+	s.statsHandler(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	var snap statsSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]upstreamServerSnapshot{}
+	for _, srv := range snap.Upstreams.Servers {
+		byName[srv.Name] = srv
+	}
+	badSnap, ok := byName["127.0.0.1:9"]
+	if !ok || badSnap.Group != "local" || badSnap.Attempts != 1 || badSnap.Errors != 1 ||
+		badSnap.LastError != "dial refused" || badSnap.LastSuccess != 0 || badSnap.Latency.Count != 1 {
+		t.Fatalf("bad upstream snapshot = %+v (found=%v)", badSnap, ok)
+	}
+	goodSnap := byName["https://1.1.1.1/dns-query"]
+	if goodSnap.Group != "extern" || goodSnap.Errors != 0 || goodSnap.LastSuccess == 0 ||
+		goodSnap.Latency.MinMs != 25 || goodSnap.Latency.MaxMs != 25 {
+		t.Fatalf("good upstream snapshot = %+v", goodSnap)
+	}
+	if snap.Queries.Latency["local"].Count != 1 || snap.Queries.Latency["extern"].Count != 1 {
+		t.Fatalf("route latency = local:%+v extern:%+v", snap.Queries.Latency["local"], snap.Queries.Latency["extern"])
+	}
+
+	recM := httptest.NewRecorder()
+	s.metricsHandler(recM, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := recM.Body.String()
+	for _, want := range []string{
+		`yellowdns_upstream_server_errors_total{group="local",upstream="127.0.0.1:9"} 1`,
+		`yellowdns_upstream_server_attempts_total{group="extern",upstream="https://1.1.1.1/dns-query"} 1`,
+		`yellowdns_upstream_server_response_seconds_count{group="extern",upstream="https://1.1.1.1/dns-query"} 1`,
+		`yellowdns_query_duration_seconds_bucket{route="local",le="0.005"} 1`,
+		`yellowdns_query_duration_seconds_bucket{route="local",le="+Inf"} 1`,
+		`yellowdns_query_duration_seconds_count{route="extern"} 1`,
+		`# TYPE yellowdns_query_duration_seconds histogram`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics body missing %q", want)
