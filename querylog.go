@@ -31,7 +31,7 @@ type queryLogEntry struct {
 	QName      string   `json:"qname"`             // 查询名（小写、保留尾点以反映线上请求原貌）
 	QType      string   `json:"qtype"`             // A / AAAA / PTR ...
 	QClass     string   `json:"qclass,omitempty"`  // IN 等；未知时给数字
-	Route      string   `json:"route"`             // hosts / local / extern / auto
+	Route      string   `json:"route"`             // hosts / local / extern / auto / negcache / deny
 	Rcode      string   `json:"rcode,omitempty"`   // NOERROR / NXDOMAIN ...；失败时为 SERVFAIL
 	Stale      bool     `json:"stale,omitempty"`   // 应答来自 serve-stale 备份
 	Answers    []string `json:"answers,omitempty"` // Answer 段摘要（IP/CNAME 目标等）
