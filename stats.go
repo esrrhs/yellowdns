@@ -69,6 +69,10 @@ var cacheStats func() (entries int, hits, misses int64)
 // staleStats 由 main 注入，返回 serve-stale 备份存储当前条目数；未注入时按 0 输出。
 var staleStats func() int
 
+// negStats 由 main 注入，返回否定应答缓存（RFC 2308）当前条目数与累计
+// 命中/未命中；未注入时按 0 输出（-negcache-ttl 0 关闭时）。
+var negStats func() (entries int, hits, misses int64)
+
 // queryLogStatus 由 main 注入，返回查询日志是否启用及累计写入/丢弃条数；
 // 未注入时按禁用输出。丢弃条数非 0 表示磁盘跟不上查询速率。
 var queryLogStatus func() (enabled bool, written, dropped int64)
@@ -168,11 +172,12 @@ func (s *statsCounters) observeResult(resp *dns.Msg, err error) {
 
 // 路由标签：与 domainlist 的 route* 常量及 hosts 合成应答路径对应。
 const (
-	routeHostsLabel  = "hosts"
-	routeLocalLabel  = "local"
-	routeExternLabel = "extern"
-	routeAutoLabel   = "auto"
-	routeDenyLabel   = "deny"
+	routeHostsLabel    = "hosts"
+	routeLocalLabel    = "local"
+	routeExternLabel   = "extern"
+	routeAutoLabel     = "auto"
+	routeDenyLabel     = "deny"
+	routeNegcacheLabel = "negcache"
 )
 
 func routeLabelOf(mode int) string {
@@ -252,7 +257,7 @@ type routeLatencySet struct {
 }
 
 func newRouteLatencySet() *routeLatencySet {
-	order := []string{routeHostsLabel, routeLocalLabel, routeExternLabel, routeAutoLabel, routeDenyLabel}
+	order := []string{routeHostsLabel, routeLocalLabel, routeExternLabel, routeAutoLabel, routeDenyLabel, routeNegcacheLabel}
 	m := make(map[string]*latencyHistogram, len(order))
 	for _, r := range order {
 		m[r] = &latencyHistogram{}
@@ -483,13 +488,17 @@ type statsSnapshot struct {
 		Servers  []upstreamServerSnapshot `json:"servers"`
 	} `json:"upstreams"`
 	Cache struct {
-		Entries      int     `json:"entries"`       // resolver 响应缓存当前条目（含未懒清理的过期项）
-		Hits         int64   `json:"hits"`          // 累计缓存命中
-		Misses       int64   `json:"misses"`        // 累计缓存未命中（含过期）
-		HitRatio     float64 `json:"hit_ratio"`     // hits/(hits+misses)，无查找时为 0
-		Flushes      int64   `json:"flushes"`       // 主动 flush 次数
-		StaleEntries int64   `json:"stale_entries"` // serve-stale 备份当前条目
-		StaleServed  int64   `json:"stale_served"`  // 上游全失败时由备份应答的累计次数
+		Entries         int     `json:"entries"`            // resolver 响应缓存当前条目（含未懒清理的过期项）
+		Hits            int64   `json:"hits"`               // 累计缓存命中
+		Misses          int64   `json:"misses"`             // 累计缓存未命中（含过期）
+		HitRatio        float64 `json:"hit_ratio"`          // hits/(hits+misses)，无查找时为 0
+		Flushes         int64   `json:"flushes"`            // 主动 flush 次数
+		StaleEntries    int64   `json:"stale_entries"`      // serve-stale 备份当前条目
+		StaleServed     int64   `json:"stale_served"`       // 上游全失败时由备份应答的累计次数
+		NegativeEntries int     `json:"negative_entries"`   // 否定缓存当前条目
+		NegativeHits    int64   `json:"negative_hits"`      // 累计否定缓存命中
+		NegativeMisses  int64   `json:"negative_misses"`    // 累计否定缓存未命中（含过期）
+		NegativeRatio   float64 `json:"negative_hit_ratio"` // 否定缓存 hits/(hits+misses)，无查找时为 0
 	} `json:"cache"`
 	Qtypes struct {
 		A     int64 `json:"A"`
@@ -574,6 +583,12 @@ func (s *statsCounters) snapshot() statsSnapshot {
 	snap.Cache.StaleServed = s.staleServed.Load()
 	if staleStats != nil {
 		snap.Cache.StaleEntries = int64(staleStats())
+	}
+	if negStats != nil {
+		snap.Cache.NegativeEntries, snap.Cache.NegativeHits, snap.Cache.NegativeMisses = negStats()
+		if lookups := snap.Cache.NegativeHits + snap.Cache.NegativeMisses; lookups > 0 {
+			snap.Cache.NegativeRatio = float64(snap.Cache.NegativeHits) / float64(lookups)
+		}
 	}
 	snap.Qtypes.A = s.qtypeA.Load()
 	snap.Qtypes.AAAA = s.qtypeAAAA.Load()
@@ -726,6 +741,13 @@ func (s *statsServer) metricsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&b, "yellowdns_cache_stale_entries %d\n", snap.Cache.StaleEntries)
 	writeHelp("yellowdns_cache_stale_served_total", "counter", "Answers served from the stale backup after all upstreams failed (includes entries still within their clamped TTL floor).")
 	fmt.Fprintf(&b, "yellowdns_cache_stale_served_total %d\n", snap.Cache.StaleServed)
+
+	writeHelp("yellowdns_cache_negative_entries", "gauge", "Negative answer (NXDOMAIN/NODATA, RFC 2308) cache entries currently held.")
+	fmt.Fprintf(&b, "yellowdns_cache_negative_entries %d\n", snap.Cache.NegativeEntries)
+	writeHelp("yellowdns_cache_negative_hits_total", "counter", "Negative cache lookups that hit a live entry.")
+	fmt.Fprintf(&b, "yellowdns_cache_negative_hits_total %d\n", snap.Cache.NegativeHits)
+	writeHelp("yellowdns_cache_negative_misses_total", "counter", "Negative cache lookups that missed (including expired entries).")
+	fmt.Fprintf(&b, "yellowdns_cache_negative_misses_total %d\n", snap.Cache.NegativeMisses)
 
 	writeHelp("yellowdns_querylog_enabled", "gauge", "1 if structured query logging is enabled.")
 	fmt.Fprintf(&b, "yellowdns_querylog_enabled %d\n", boolToInt64(snap.QueryLog.Enabled))

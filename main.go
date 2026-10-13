@@ -154,6 +154,12 @@ type routingResolver struct {
 	minTTL   time.Duration
 	maxTTL   time.Duration
 
+	// neg 是可选的否定应答缓存（NXDOMAIN/NODATA，RFC 2308）；negTTL 为 0
+	// （功能关闭）时不写入也不读取。gohome 内置缓存只收录带 Answer 的正向
+	// 应答，否定应答在这一层补上。
+	neg    *negativeCache
+	negTTL time.Duration
+
 	// qlog 为可选的结构化查询日志；nil 表示关闭，recordQueryLog 直接跳过。
 	qlog *queryLogger
 
@@ -204,6 +210,15 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 		return hit, nil
 	}
 
+	// 否定缓存（RFC 2308）：NXDOMAIN/NODATA 不被 gohome 内置缓存收录，
+	// 在这里按剩余 TTL 衰减后直接下发，命中不再消耗任何上游资源。
+	// 位置在 hosts 之后（静态规则永远优先）与 ECS/路由判定之前
+	// （本地命中无需改写发往上游的报文）。
+	if resp, ok := r.negativeHit(req); ok {
+		routeLabel = routeNegcacheLabel
+		return resp, nil
+	}
+
 	// ECS 只影响发往上游的报文（gohome/绕行/兜底三条路径共用同一个 req），
 	// hosts 合成应答不需要；放在所有上游分支之前统一改写一次。
 	if applyECS(req, r.ecs) {
@@ -217,7 +232,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 		metrics.observeRoute(routeExtern, true)
 		resp, err = exchangeList(ctx, r.external, req, r.timeout)
 		if err == nil && resp != nil {
-			return r.rememberAnswer(req, resp), nil
+			return r.remember(req, resp), nil
 		}
 		if stale, ok := r.serveStale(req); ok {
 			servedStale = true
@@ -230,7 +245,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 		resp, err = r.inner.Exchange(ctx, req)
 		if err == nil && resp != nil {
 			metrics.observeRoute(mode, false)
-			return r.rememberAnswer(req, resp), nil
+			return r.remember(req, resp), nil
 		}
 		loggo.Warn("gohome resolver Exchange fail %v, fallback to direct upstream", err)
 	}
@@ -244,7 +259,7 @@ func (r *routingResolver) Exchange(ctx context.Context, req *dns.Msg) (resp *dns
 	metrics.observeRoute(mode, false)
 	resp, err = exchangeList(ctx, list, req, r.timeout)
 	if err == nil && resp != nil {
-		return r.rememberAnswer(req, resp), nil
+		return r.remember(req, resp), nil
 	}
 	// 所有上游都失败：若最近成功解析过该名字，在允许窗口内返回旧应答，
 	// 让断网/上游抖动期间的业务至少拿到一个大概率仍可用的地址。
@@ -260,18 +275,57 @@ func staleKey(q dns.Question) string {
 	return cache.KeyForMsg(q.Name, q.Qtype, q.Qclass)
 }
 
-// rememberAnswer 对成功应答套用 min/max TTL 收敛，并登记到 serve-stale 备份。
-// 只备份带 Answer 的正向应答（与 gohome 内置缓存的落盘口径一致）；
-// NODATA/NXDOMAIN 等否定应答不备份。
-func (r *routingResolver) rememberAnswer(req *dns.Msg, resp *dns.Msg) *dns.Msg {
-	if resp == nil || len(resp.Answer) == 0 {
+// remember 对成功应答做本地登记：
+//   - 正向应答（带 Answer）套 min/max TTL 收敛，并登记到 serve-stale 备份；
+//   - 否定应答（NXDOMAIN/NODATA）按 RFC 2308 写入否定缓存。
+//
+// 上游查询失败（err != nil）时不落任何缓存；否定缓存的写入失败（无 SOA、
+// SERVFAIL 等）只影响缓存，不改变返回给客户端的应答。
+func (r *routingResolver) remember(req *dns.Msg, resp *dns.Msg) *dns.Msg {
+	if resp == nil {
 		return resp
 	}
-	effective := clampResponseTTL(resp, r.minTTL, r.maxTTL)
-	if r.stale != nil && r.staleTTL > 0 && effective > 0 {
-		r.stale.put(staleKey(req.Question[0]), resp, time.Now().Add(effective))
+	if len(resp.Answer) > 0 {
+		effective := clampResponseTTL(resp, r.minTTL, r.maxTTL)
+		if r.stale != nil && r.staleTTL > 0 && effective > 0 {
+			r.stale.put(staleKey(req.Question[0]), resp, time.Now().Add(effective))
+		}
+		return resp
 	}
+	r.rememberNegative(req, resp)
 	return resp
+}
+
+// negativeHit 查询否定缓存；命中时把应答的 Id/Question 对到当前请求，
+// 与 serve-stale 的下发口径一致（存的是不含请求信息的报文副本）。
+func (r *routingResolver) negativeHit(req *dns.Msg) (*dns.Msg, bool) {
+	if r.neg == nil || r.negTTL <= 0 {
+		return nil, false
+	}
+	resp, ok := r.neg.get(negKey(req.Question[0]))
+	if !ok {
+		return nil, false
+	}
+	resp.Id = req.Id
+	resp.Question = req.Question
+	return resp, true
+}
+
+// rememberNegative 把否定应答写入否定缓存。TTL 取 SOA 记录 TTL 与
+// MINIMUM 的较小值，经 -negcache-ttl 封顶与 min/max TTL 收敛；随后把
+// 报文内所有记录 TTL 统一改写成该值再落库——当前客户端拿到的 TTL 与
+// 后续缓存命中下发的一致，也避免上游超长 SOA TTL 被封顶后出现
+// "应答 TTL 大于本地缓存寿命"的倒挂。
+func (r *routingResolver) rememberNegative(req *dns.Msg, resp *dns.Msg) {
+	if r.neg == nil || r.negTTL <= 0 || !isCacheableNegative(resp) {
+		return
+	}
+	ttl := negativeResponseTTL(resp, r.negTTL, r.minTTL, r.maxTTL)
+	if ttl <= 0 {
+		return
+	}
+	rewriteTTL(resp, uint32(ttl.Seconds()))
+	r.neg.put(negKey(req.Question[0]), resp, time.Now().Add(ttl))
 }
 
 // serveStale 在全部上游失败后尝试返回备份应答。新鲜期内的备份按剩余 TTL
@@ -352,8 +406,8 @@ func (r *routingResolver) staleLen() int {
 	return r.stale.len()
 }
 
-// flushCache 清空 gohome 响应缓存与 serve-stale 备份，返回清空前的条目总数
-// （供运维确认效果）。
+// flushCache 清空 gohome 响应缓存、serve-stale 备份与否定缓存，返回清空前的
+// 条目总数（供运维确认效果）。
 func (r *routingResolver) flushCache() int {
 	n := 0
 	if r.inner != nil {
@@ -363,6 +417,10 @@ func (r *routingResolver) flushCache() int {
 	if r.stale != nil {
 		n += r.stale.len()
 		r.stale.clear()
+	}
+	if r.neg != nil {
+		n += r.neg.len()
+		r.neg.clear()
 	}
 	return n
 }
@@ -397,6 +455,11 @@ func (r *routingResolver) reload(chinaFiles, gfwFiles, hostsFiles []string, geoF
 	if r.stale != nil {
 		r.stale.clear()
 	}
+	// 否定缓存同理：NXDOMAIN 可能正是规则变更要修复的对象（如域名从
+	// gfw 列表移除），不清会把旧结论留到 TTL 到期。
+	if r.neg != nil {
+		r.neg.clear()
+	}
 	return chinaN, gfwN, hostsN, nil
 }
 
@@ -418,10 +481,11 @@ func main() {
 	updateEvery := flag.Duration("update", 0, "auto-update remote china/gfw lists and GeoIP database at this interval (e.g. 24h); 0 disables")
 	updateDir := flag.String("update-dir", ".", "directory to store downloaded remote lists and GeoIP database")
 	shutdownDelay := flag.Duration("shutdown-delay", 0, "delay between /readyz turning 503 and closing DNS listeners on SIGTERM/SIGINT, giving load balancers time to drain (e.g. 2s); 0 disables")
-	cacheSize := flag.Int("cache-size", 2000, "response cache capacity in entries (gohome cache and serve-stale backup share this limit)")
+	cacheSize := flag.Int("cache-size", 2000, "response cache capacity in entries, shared by the gohome cache, the serve-stale backup and the negative cache")
 	cacheMinTTL := flag.Duration("cache-min-ttl", 0, "floor TTL applied to every upstream answer before caching and replying (e.g. 60s); 0 disables")
 	cacheMaxTTL := flag.Duration("cache-max-ttl", 0, "ceiling TTL applied to every upstream answer before caching and replying (e.g. 24h); 0 disables")
 	serveStale := flag.Duration("serve-stale", 0, "when all upstreams fail, keep replying with the last good answer for this long past its TTL (e.g. 24h); stale replies carry a 5s TTL. 0 disables")
+	negcacheTTL := flag.Duration("negcache-ttl", time.Hour, "max TTL for cached negative answers (NXDOMAIN/NODATA, RFC 2308), derived from the SOA record and capped here; shares -cache-size. 0 disables negative caching")
 	queryLogFile := flag.String("query-log", "", "write one JSON line per query to this file (e.g. query.log); '-' writes to stdout; empty disables. Rotated by size and reopened on SIGHUP")
 	queryLogMaxMB := flag.Int("query-log-max-mb", 100, "rotate the query log after it reaches this size in MiB; 0 disables size rotation")
 	queryLogMaxFiles := flag.Int("query-log-max-files", 5, "number of rotated query log files to keep (query.log.1 .. query.log.N)")
@@ -480,6 +544,10 @@ func main() {
 	}
 	if *queryLogMaxMB < 0 || *queryLogMaxFiles < 0 {
 		loggo.Error("-query-log-max-mb and -query-log-max-files must not be negative")
+		return
+	}
+	if *negcacheTTL < 0 {
+		loggo.Error("-negcache-ttl must not be negative")
 		return
 	}
 	ecsPolicy, err := parseECSPolicy(*ecsCIDR, *ecsStrip)
@@ -618,6 +686,13 @@ func main() {
 		}
 	}
 
+	// 否定缓存与 gohome 缓存、serve-stale 备份共享 -cache-size 容量；
+	// -negcache-ttl 为 0 时整个功能关闭（不创建，各方法对 nil 接收者安全）。
+	var negCache *negativeCache
+	if *negcacheTTL > 0 {
+		negCache = newNegativeCache(*cacheSize)
+	}
+
 	rr := &routingResolver{
 		inner:    res,
 		local:    localUpstreams,
@@ -627,6 +702,8 @@ func main() {
 		staleTTL: *serveStale,
 		minTTL:   *cacheMinTTL,
 		maxTTL:   *cacheMaxTTL,
+		neg:      negCache,
+		negTTL:   *negcacheTTL,
 		qlog:     qlog,
 		ecs:      ecsPolicy,
 		policy:   clientPolicyRule,
@@ -634,6 +711,9 @@ func main() {
 	// 探针服务先于 resolver 启动，回调在 resolver 就绪后补注入。
 	cacheStats = rr.cacheStats
 	staleStats = rr.staleLen
+	if negCache != nil {
+		negStats = negCache.stats
+	}
 	if qlog != nil {
 		queryLogStatus = func() (enabled bool, written, dropped int64) {
 			w, d := qlog.stats()
@@ -642,6 +722,9 @@ func main() {
 	}
 	if *serveStale > 0 {
 		loggo.Info("serve-stale enabled: last good answer kept for %v past expiry", *serveStale)
+	}
+	if *negcacheTTL > 0 {
+		loggo.Info("negative cache enabled: NXDOMAIN/NODATA cached up to %v (rfc 2308)", *negcacheTTL)
 	}
 	if *cacheMinTTL > 0 || *cacheMaxTTL > 0 {
 		loggo.Info("cache ttl clamp: min=%v max=%v", *cacheMinTTL, *cacheMaxTTL)
