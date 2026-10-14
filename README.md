@@ -28,7 +28,7 @@ Docker:
 docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp -p 55353:55353/tcp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
 ```
 
-Images are multi-arch (`linux/amd64`, `linux/arm64`). Tagging a release pushes both `esrrhs/yellowdns:latest` and `esrrhs/yellowdns:<tag>`, so pinning a version is possible.
+Images are multi-arch (`linux/amd64`, `linux/arm64`) and published as `esrrhs/yellowdns:latest`; the release version is baked into the binary, so `yellowdns -version` inside the container reports it.
 
 If port 53 is already taken by another interface, listen on `127.0.0.1:53` instead.
 
