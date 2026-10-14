@@ -65,6 +65,10 @@ The release image is based on `debian:bookworm-slim` with `ca-certificates` inst
   * `GET /debug/pprof/` — Go runtime profiler pages (`goroutine`, `heap`, `profile?seconds=N`, `trace?seconds=N`, ...), only registered with `-pprof`; same bearer auth as `/stats`. Point `go tool pprof http://127.0.0.1:8053/debug/pprof/profile?seconds=30` at it for a CPU profile
 * `-stats-token`: bearer token required to access `/stats`, `/metrics`, `POST /cache/flush`, `POST /update/refresh` and `/debug/pprof/`; defaults to the `YELLOWDNS_STATS_TOKEN` environment variable (preferred, so the token does not show in `ps`). `/healthz` and `/readyz` stay unauthenticated. When unset the endpoints are open, so bind `-stats` to loopback; a non-loopback bind without a token logs a warning
 * `-pprof`: enable the `net/http/pprof` profiler under `/debug/pprof/` on the `-stats` server for live CPU/heap/goroutine/trace debugging; default off. Starting with pprof on a non-loopback `-stats` address and no token is refused; `-pprof` without `-stats` logs a warning and has no effect
+* `-timeout`: upstream query timeout in milliseconds, default `5000`
+* `-loglevel`: log level (`debug`, `info`, `warn`, `error`), default `info`
+* `-nolog`: set to a non-zero value to stop writing log files (`yellowdns_<LEVEL>_<date>.log`) in the working directory
+* `-noprint`: set to a non-zero value to stop echoing log lines to stdout
 * `-version`: show version and exit
 * other options: `./yellowdns -h`
 
