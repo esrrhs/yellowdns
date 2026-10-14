@@ -28,6 +28,8 @@ Docker:
 docker run --name yellowdns -d --net=host --restart=always -p 55353:55353/udp -p 55353:55353/tcp esrrhs/yellowdns ./yellowdns -l :55353 -exs 127.0.0.1:55354
 ```
 
+Images are multi-arch (`linux/amd64`, `linux/arm64`). Tagging a release pushes both `esrrhs/yellowdns:latest` and `esrrhs/yellowdns:<tag>`, so pinning a version is possible.
+
 If port 53 is already taken by another interface, listen on `127.0.0.1:53` instead.
 
 The release image is based on `debian:bookworm-slim` with `ca-certificates` installed (required for the default DoH upstreams) and runs as a non-root user; `/app` is writable so `-update` can persist the downloaded lists and GeoIP database in the default working directory.
