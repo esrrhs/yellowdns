@@ -12,4 +12,6 @@ yellowdns.exe
 pack/
 pack.zip
 dist/
-data/
+# 注意：data/ 必须保留。domainlist.go 用 //go:embed data/china.txt data/gfw.txt
+# 把国内/干扰列表编进二进制，排除掉会直接编译失败（这是编译期输入，不是
+# -update-dir 的运行时落盘目录，后者默认落在工作目录）。
