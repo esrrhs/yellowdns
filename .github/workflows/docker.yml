@@ -21,7 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # 只有 tag push 才有版本号；手动触发时用输入的 version，没有就只推 latest。
+      # 镜像只推 latest 一个 tag，这里推导的版本号仅用于 --build-arg，
+      # 让容器里 `yellowdns -version` 输出真实版本而不是默认的 dev。
       - name: Derive version
         id: ver
         run: |
@@ -52,7 +53,6 @@ jobs:
           images: esrrhs/yellowdns
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.ver.outputs.value }},enable=${{ steps.ver.outputs.value != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
